@@ -1,0 +1,18 @@
+# Rust
+/backend/target/
+# Node
+/frontend/node_modules/
+/frontend/dist/
+# Runtime data (SQLite db lives here by default)
+/data/
+/backend/data/
+*.db
+*.db-wal
+*.db-shm
+# Secrets
+.env
+# Editors / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/

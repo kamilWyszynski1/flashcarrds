@@ -1,0 +1,9 @@
+pub mod app;
+pub mod db;
+pub mod error;
+pub mod gemini;
+pub mod guard;
+pub mod models;
+pub mod repo;
+pub mod routes;
+pub mod srs;
