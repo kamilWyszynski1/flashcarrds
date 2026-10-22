@@ -1,11 +1,13 @@
 # Rust
 /backend/target/
+/server/target/
 # Node
 /frontend/node_modules/
 /frontend/dist/
 # Runtime data (SQLite db lives here by default)
 /data/
 /backend/data/
+/server/data/
 *.db
 *.db-wal
 *.db-shm
