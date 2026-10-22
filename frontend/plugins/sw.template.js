@@ -2,6 +2,7 @@
 /* global self, caches, fetch, Response */
 const VERSION = '__VERSION__';
 const PRECACHE = __PRECACHE__;
+const BASE = '__BASE__';
 const SHELL = `fiszki-shell-${VERSION}`;
 const API = 'fiszki-api';
 const FONTS = 'fiszki-fonts';
@@ -52,13 +53,13 @@ self.addEventListener('fetch', (event) => {
   // App navigations: network first, fall back to the cached shell.
   if (req.mode === 'navigate') {
     event.respondWith(
-      fetch(req).catch(async () => (await caches.match('/index.html')) || Response.error()),
+      fetch(req).catch(async () => (await caches.match(BASE + 'index.html')) || (await caches.match(BASE)) || Response.error()),
     );
     return;
   }
 
   if (url.origin === self.location.origin) {
-    if (url.pathname.startsWith('/api/')) {
+    if (url.pathname.startsWith(BASE + 'api/') || url.pathname.startsWith('/api/')) {
       // Read-only API: fresh when online, last known copy when offline.
       event.respondWith(
         withTimeout(fetch(req), 8000)
@@ -82,7 +83,7 @@ self.addEventListener('fetch', (event) => {
         (hit) =>
           hit ||
           fetch(req).then((res) => {
-            if (res.ok && (url.pathname.startsWith('/assets/') || url.pathname.startsWith('/icons/'))) {
+            if (res.ok && (url.pathname.startsWith(BASE + 'assets/') || url.pathname.startsWith(BASE + 'icons/') || url.pathname.startsWith('/assets/') || url.pathname.startsWith('/icons/'))) {
               const copy = res.clone();
               caches.open(SHELL).then((c) => c.put(req, copy));
             }

@@ -19,6 +19,8 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
 // (https or localhost) – see README for reaching the phone.
 if (import.meta.env.PROD && 'serviceWorker' in navigator) {
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('/sw.js').catch((e) => console.warn('SW registration failed', e));
+    navigator.serviceWorker
+      .register(`${import.meta.env.BASE_URL}sw.js`, { scope: import.meta.env.BASE_URL })
+      .catch((e) => console.warn('SW registration failed', e));
   });
 }

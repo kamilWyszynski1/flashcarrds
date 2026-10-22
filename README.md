@@ -1,15 +1,19 @@
 # Fiszki
 
-Personal flashcards app for learning vocabulary from a textbook (built for
-*Aula Internacional 1*, used on a Samsung Galaxy S23). Photograph a page, let
-Gemini pull out the word pairs, review them, and study with spaced repetition.
+Personal flashcards PWA for learning vocabulary from a textbook (built for
+*Aula Internacional 1*, tested on Android Chrome). Photograph a textbook page,
+let Gemini pull out the word pairs, review them, and study with spaced repetition.
+
+Runs as a **local-first Progressive Web App (PWA)** entirely in your phone's
+browser: data is stored in **IndexedDB** on your device, and Gemini extraction
+calls Google's API directly from the browser over HTTPS. **Zero backend server required.**
 
 ```
 flashcarrds/
-├── backend/    Rust (axum) API server + SQLite, serves the built frontend
-├── frontend/   React + TypeScript + Vite + Tailwind PWA
-├── Makefile    one-liners for dev / build / run
-└── data/       fiszki.db is created here on first run (git-ignored)
+├── frontend/   React + TypeScript + Vite + Tailwind PWA (Dexie / IndexedDB)
+├── server/     Optional: Rust (axum) + SQLite server for self-hosting
+├── Makefile    one-liners for dev / build / test / run
+└── data/       fiszki.db used only in self-hosted server mode (git-ignored)
 ```
 
 ## Features
@@ -30,45 +34,89 @@ flashcarrds/
    selection. Flip card, four grades (Again / Hard / Good / Easy) with the next
    interval shown, in-session re-queue of missed cards, session summary with
    "repeat the missed".
+4. **Local-first & offline** – all cards, decks, review history, and settings
+   are persisted in IndexedDB on the device. Full offline study support via
+   service worker precaching.
+5. **Privacy & safety** – your Gemini API key is stored only in your local
+   browser and never sent to any intermediary server. Extraction includes daily
+   caps and sliding-window rate limiters.
+6. **Data portability** – full JSON backup export and import with deduplication.
 
-Also: installable PWA (offline shell + last-known lists), theme setting
-(Light by default – the Stitch design; Dark / System are opt-in in Settings),
-Android back gesture closes sheets/screens like a native app, JSON backup
-export/import, languages are a setting (defaults Español → Polski; change to
-Polski → English or anything else in Settings).
+---
 
-## Run it
+## Deploy to GitHub Pages & Install on Android
 
-Prerequisites: Rust (stable), Node 20+.
+The easiest way to use Fiszki on your phone is via GitHub Pages:
+
+### 1. Enable GitHub Pages in your repo
+1. Open your GitHub repository (e.g. `kamilWyszynski1/flashcarrds`).
+2. Go to **Settings** → **Pages**.
+3. Under **Build and deployment** → **Source**, select **GitHub Actions**.
+
+### 2. Deploy
+Push to `master` (or `main`). The included `.github/workflows/deploy-pages.yml`
+workflow automatically runs tests, builds the subpath-safe PWA, and deploys it to:
+```
+https://<username>.github.io/<repository-name>/
+```
+*(e.g. `https://kamilwyszynski1.github.io/flashcarrds/`)*
+
+### 3. Install on Android
+1. Open your GitHub Pages URL in **Google Chrome on Android**.
+2. Tap the in-app **Settings** → **Install as app**, or open the Chrome menu
+   (**⋮**) and tap **Add to Home screen** / **Install app**.
+3. Fiszki will be installed on your home screen with an app icon and standalone
+   display mode, operating fully offline.
+
+### 4. Configure Gemini Photo Extraction
+1. Get a free Gemini API key from [Google AI Studio](https://aistudio.google.com/apikey).
+2. Open Fiszki on your phone, go to **Settings**, and paste your API key
+   (`AIza...`) into the **API key** field and tap **Save**.
+3. The key is stored securely in your browser's IndexedDB and used directly for
+   HTTPS calls to Google's Gemini API when extracting textbook photos.
+
+---
+
+## Local Development (Frontend)
+
+Prerequisites: Node.js 20+.
 
 ```bash
-make build      # npm install + vite build + cargo build --release
-make run        # serves http://localhost:8080  (API + PWA)
+cd frontend
+npm install
+npm test            # run vitest suite (61 tests)
+npm run dev         # start Vite dev server on http://localhost:5173
+npm run build       # build production PWA to frontend/dist
 ```
 
-Photo extraction needs a Gemini API key (from
-<https://aistudio.google.com/apikey>). Put it in `backend/.env` (copy
-`backend/.env.example`) or export it before starting:
+To test building for a GitHub Pages subpath locally:
+```bash
+cd frontend
+VITE_BASE_PATH=/flashcarrds/ npm run build
+npx vite preview --host 127.0.0.1 --port 18131
+```
+
+---
+
+## Optional: Self-Hosted Server Mode (`VITE_BACKEND=http`)
+
+If you prefer hosting a central backend with SQLite on a home server (Raspberry Pi,
+NAS, or VM) instead of on-device IndexedDB:
+
+Prerequisites: Rust (stable) and Node 20+.
 
 ```bash
-GEMINI_API_KEY=AIza...            # required for "Cards from photo"
+make build          # builds frontend with VITE_BACKEND=http + cargo release binary
+make run            # serves http://localhost:8080 (axum API + static PWA)
+```
+
+Photo extraction in server mode uses `GEMINI_API_KEY` configured on the server:
+```bash
+GEMINI_API_KEY=AIza...            # required for "Cards from photo" in server mode
 FISZKI_GEMINI_MODEL=gemini-flash-latest   # optional
 ```
 
-The key and model are **server configuration only** – they are not stored in
-the database and cannot be read or changed from the app (Settings shows them
-read-only). That way a leaked app password cannot be used to swap the key or
-point extraction at a more expensive model.
-
-### Development
-
-```bash
-make dev-backend    # cargo run, API on :8080 (auto-detects ../frontend/dist if built)
-make dev-frontend   # vite on :5173 with /api proxied to :8080, hot reload
-make test           # cargo test + vitest
-```
-
-### Configuration (env vars, `.env` is read)
+### Server Configuration (env vars, `.env` is read)
 
 | Variable                    | Default               | Meaning                                                        |
 |-----------------------------|-----------------------|----------------------------------------------------------------|
@@ -78,103 +126,27 @@ make test           # cargo test + vitest
 | `FISZKI_BASIC_AUTH`         | – (off)               | `user:password` → HTTP Basic auth for the whole app            |
 | `FISZKI_EXTRACT_DAILY_CAP`  | `60`                  | max `/api/extract` calls per local day (`0` = unlimited)       |
 | `FISZKI_EXTRACT_PER_MINUTE` | `6`                   | max `/api/extract` calls per minute (`0` = unlimited)          |
-| `GEMINI_API_KEY`            | –                     | the Gemini key (required for extraction; env only, never stored) |
+| `GEMINI_API_KEY`            | –                     | the Gemini key (server-side only, never stored in DB)          |
 | `FISZKI_GEMINI_MODEL`       | `gemini-flash-latest` | model id (`models/` prefix accepted; validated at startup)     |
 | `FISZKI_GEMINI_TIMEOUT_SECS`| `30`                  | per-attempt Gemini timeout (5–300); one retry on a fast `503`  |
-| `GEMINI_BASE_URL`           | Google's endpoint     | override (tests / proxies)                                     |
 | `RUST_LOG`                  | `info`                | tracing filter (`fiszki_server=debug` logs each Gemini call)   |
 
-### Using it on the phone
-
-Service workers and "Install app" need a **secure context**: `https://` or
-`http://localhost`. Plain `http://<ip>:8080` over Wi‑Fi still works as a
-website, just without install/offline. Options, simplest first:
-
-1. **USB + adb** (phone appears as localhost):
-   `adb reverse tcp:8080 tcp:8080` → open `http://localhost:8080` in Chrome →
-   menu → *Install app*.
-2. **Tailscale / any VPN with HTTPS** (e.g. `tailscale serve 8080` gives you an
-   `https://…ts.net` URL) – the nicest permanent setup.
-3. Put a reverse proxy with a real certificate (Caddy does it automatically)
-   in front of the server.
-
-The server itself is a single binary (`backend/target/release/fiszki-server`)
-plus the `frontend/dist` folder and the SQLite file – trivial to move to a
-Raspberry Pi, a NAS or a small VM.
-
-### Safeguards (PoC level)
-
-Single-user app, so the protection is deliberately simple:
-
-- **`FISZKI_BASIC_AUTH=user:password`** puts the whole app (PWA + API, except
-  `/api/health`) behind HTTP Basic auth. Off by default; the server logs a
-  warning when it listens on a non-loopback address without it. Only use it
-  over HTTPS (or a VPN) – Basic auth is plaintext otherwise.
-- **Extraction budget**: `/api/extract` is limited per minute (in memory) and
-  per local day (persisted in the DB, survives restarts). Failed Gemini calls
-  count too. Over the limit → `429 rate_limited`.
-- **Pause switch** in Settings rejects every extraction with `409 paused`
-  without touching Gemini – flip it if a key or device gets lost.
-- **Usage counter** (today / cap · total) is shown in Settings.
-- **Input caps**: ≤ 4 images, ≤ 8 MB base64 each, ≤ 20 MB together, hint
-  ≤ 2000 chars, request body ≤ 21 MB.
-- **Key and model are env-only** (`GEMINI_API_KEY`, `FISZKI_GEMINI_MODEL`):
-  `PATCH /settings` rejects them with `400`, nothing key-related is ever
-  written to SQLite (migration v2 purges rows left by older builds), and the
-  API only reports *whether* a key is set.
-- **Bounded upstream calls**: one extraction is capped at
-  `FISZKI_GEMINI_TIMEOUT_SECS` (30 s) with a 10 s connect timeout; a `503`
-  that comes back within 10 s is retried once after 1.5 s *within the same
-  budget* (so the worst case is ~31.5 s, not 60 s). Anything else is a
-  `502 upstream` whose `message` is the full error chain – stage, model,
-  image count/sizes, latency, upstream HTTP status and Gemini's own message –
-  and the same line is logged at `error` (plus a `warn` from
-  `fiszki_server::gemini` with the first 2 KB of the upstream body) before
-  `tower_http`'s generic `on_failure`. The same goes for every other non-2xx:
-  handler errors log through `AppError`, malformed/oversized request bodies
-  come back as `400`/`413` in the same JSON shape, and anything else (Basic
-  auth `401`, unknown route) is logged by a catch-all middleware.
-
-The Gemini key itself is never returned by the API or written to the log. Still:
-keep the port on `localhost`, a VPN (Tailscale) or behind an authenticating
-HTTPS proxy.
-
-## API (all JSON, under `/api`)
-
-| Method & path                     | Purpose                                              |
-|-----------------------------------|------------------------------------------------------|
-| `GET  /overview`                  | units → lessons with counts, due today, new budget   |
-| `POST /units` · `PATCH/DELETE /units/{id}`         | unit CRUD                           |
-| `POST /lessons` · `GET/PATCH/DELETE /lessons/{id}` | lesson CRUD (+ cards in GET)        |
-| `GET  /cards?q=&status=&lesson_id=&unit_id=&sort=` | list/search                         |
-| `POST /cards` · `POST /cards/bulk` · `PATCH/DELETE /cards/{id}` | card CRUD              |
-| `GET  /study/queue?scope=all\|lesson:ID\|unit:ID&mode=due\|all&ids=` | cards to study    |
-| `POST /study/review {card_id, grade, direction}`  | apply a grade                        |
-| `POST /extract {images:[{mime_type,data}], hint}` | Gemini extraction                    |
-| `GET/PATCH /settings`             | languages, direction, limits, pause switch; key/model read-only |
-| `GET /export` · `POST /import`    | JSON backup                                          |
+---
 
 ## Scheduling
 
-An SM‑2 style scheduler with Anki‑like learning steps (`backend/src/srs.rs`):
-new/learning cards: Again → 1 min, Hard → 6 min, Good → 1 day, Easy → 4 days;
-review cards multiply the interval by ease (Hard ×1.2, Good ×ease, Easy
-×ease×1.3), Again lapses to 10 min and shrinks the interval. All state is on
-the card row, so the algorithm can be swapped (e.g. for FSRS) without a
-migration.
+An SM‑2 style spaced repetition scheduler (`srs.ts` in frontend, `srs.rs` in server):
+- New / learning cards: Again → 1 min, Hard → 6 min, Good → 1 day, Easy → 4 days.
+- Review cards multiply the interval by ease factor (Hard ×1.2, Good ×ease, Easy ×ease×1.3).
+- Again lapses back into relearning (10 min) and decreases ease.
+- Intervals are capped and formatted into human-readable labels.
 
-## Android app later?
+---
 
-The UI is a standard React web app, so the path to Android is a **Trusted Web
-Activity** (Bubblewrap/PWABuilder wrap the installed PWA into a Play‑Store
-APK) or **Capacitor** (same web build inside a WebView with native plugins).
-Both reuse this codebase as is; React Native would have meant rewriting the
-UI and giving up the Tailwind design tokens from the Stitch mock.
+## Testing
 
-## Tests
-
-- `backend`: unit tests for the scheduler, repository (in‑memory SQLite),
-  Gemini prompt/response parsing; integration tests drive the real router,
-  including `/api/extract` against a fake Gemini server.
-- `frontend`: vitest for the in‑session queue logic, paste parser and
-  formatting; `tsc --noEmit` on build.
+- `frontend`: 61 vitest unit and integration tests covering scheduling, Dexie
+  IndexedDB operations, duplicate detection, sliding-window rate limiters, and
+  Gemini prompt/response parsing.
+- `server`: 59 cargo unit and integration tests for SQLite migrations, scheduler,
+  and HTTP API endpoints.

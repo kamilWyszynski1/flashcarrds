@@ -5,6 +5,7 @@ import { pwaPlugin } from './plugins/pwa';
 // The Rust server is the single origin in production (it serves `dist/` and
 // `/api`). In development Vite proxies `/api` to it.
 export default defineConfig({
+  base: process.env.VITE_BASE_PATH || '/',
   plugins: [react(), pwaPlugin()],
   server: {
     host: true,

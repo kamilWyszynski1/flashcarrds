@@ -22,7 +22,7 @@ function ScrollToTop() {
 
 export function App() {
   return (
-    <BrowserRouter>
+    <BrowserRouter basename={import.meta.env.BASE_URL.replace(/\/$/, '') || '/'}>
       <StoreProvider>
         <ScrollToTop />
         <datalist id="lang-suggestions">
