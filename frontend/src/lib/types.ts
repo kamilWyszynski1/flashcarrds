@@ -81,9 +81,10 @@ export interface Settings {
   study_direction: 'front_to_back' | 'back_to_front' | 'mixed';
   new_per_day: number;
   haptics: boolean;
+  /** Read-only: server env `FISZKI_GEMINI_MODEL` (default gemini-flash-latest). */
   gemini_model: string;
+  /** Read-only: whether the server has `GEMINI_API_KEY`. */
   gemini_api_key_set: boolean;
-  gemini_api_key_hint: string | null;
   last_lesson_id: number | null;
   /** Kill switch for "Cards from photo". */
   extraction_paused: boolean;
@@ -95,9 +96,8 @@ export interface Settings {
   theme: Theme;
 }
 
-export type SettingsPatch = Partial<Omit<Settings, 'gemini_api_key_set' | 'gemini_api_key_hint' | 'extractions_today' | 'extractions_total' | 'extract_daily_cap'>> & {
-  gemini_api_key?: string;
-};
+/** Only the user-editable fields – the key and model are server configuration and the API rejects them. */
+export type SettingsPatch = Partial<Omit<Settings, 'gemini_model' | 'gemini_api_key_set' | 'extractions_today' | 'extractions_total' | 'extract_daily_cap'>>;
 
 export interface Preview {
   again: number;

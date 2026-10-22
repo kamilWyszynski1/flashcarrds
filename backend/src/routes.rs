@@ -1,11 +1,12 @@
 //! HTTP API handlers.
 
 use std::sync::MutexGuard;
+use std::time::Instant;
 
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    routing::{get, post},
+    routing::{get, patch, post},
     Json, Router,
 };
 use rusqlite::Connection;
@@ -13,7 +14,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::app::AppState;
-use crate::error::{AppError, AppResult};
+// Request bodies: our extractor (rejections become logged `AppError`s in the
+// usual JSON shape). Responses: `axum::Json` above.
+use crate::error::{AppError, AppResult, Json as Body};
 use crate::gemini::{self, ExtractRequest, GeminiError, ImageInput};
 use crate::models::*;
 use crate::repo::{self, Backup, CardFilter, CardPatch, NewCard, QueueRequest};
@@ -24,7 +27,7 @@ pub fn api_router() -> Router<AppState> {
         .route("/health", get(health))
         .route("/overview", get(get_overview))
         .route("/units", get(list_units).post(create_unit))
-        .route("/units/{id}", axum::routing::patch(patch_unit).delete(delete_unit))
+        .route("/units/{id}", patch(patch_unit).delete(delete_unit))
         .route("/lessons", get(list_lessons).post(create_lesson))
         .route("/lessons/{id}", get(get_lesson).patch(patch_lesson).delete(delete_lesson))
         .route("/cards", get(list_cards).post(create_card))
@@ -47,7 +50,8 @@ fn bad(e: anyhow::Error) -> AppError {
     if e.downcast_ref::<rusqlite::Error>().is_some() {
         AppError::Internal(e)
     } else {
-        AppError::BadRequest(e.to_string())
+        // `{:#}` keeps any `.context(..)` the repo added, not just the top line.
+        AppError::BadRequest(format!("{e:#}"))
     }
 }
 
@@ -72,12 +76,12 @@ async fn list_units(State(s): State<AppState>) -> AppResult<Json<Vec<Unit>>> {
     Ok(Json(repo::list_units(&conn)?))
 }
 
-async fn create_unit(State(s): State<AppState>, Json(b): Json<NameBody>) -> AppResult<(StatusCode, Json<Unit>)> {
+async fn create_unit(State(s): State<AppState>, Body(b): Body<NameBody>) -> AppResult<(StatusCode, Json<Unit>)> {
     let conn = lock(&s)?;
     Ok((StatusCode::CREATED, Json(repo::create_unit(&conn, &b.name).map_err(bad)?)))
 }
 
-async fn patch_unit(State(s): State<AppState>, Path(id): Path<i64>, Json(b): Json<NameBody>) -> AppResult<Json<Unit>> {
+async fn patch_unit(State(s): State<AppState>, Path(id): Path<i64>, Body(b): Body<NameBody>) -> AppResult<Json<Unit>> {
     let conn = lock(&s)?;
     repo::rename_unit(&conn, id, &b.name).map_err(bad)?.map(Json).ok_or_else(|| AppError::NotFound(format!("unit {id} not found")))
 }
@@ -120,7 +124,7 @@ async fn list_lessons(State(s): State<AppState>) -> AppResult<Json<Vec<Lesson>>>
     Ok(Json(repo::list_lessons(&conn)?))
 }
 
-async fn create_lesson(State(s): State<AppState>, Json(b): Json<NewLessonBody>) -> AppResult<(StatusCode, Json<Lesson>)> {
+async fn create_lesson(State(s): State<AppState>, Body(b): Body<NewLessonBody>) -> AppResult<(StatusCode, Json<Lesson>)> {
     let conn = lock(&s)?;
     Ok((StatusCode::CREATED, Json(repo::create_lesson(&conn, b.unit_id, &b.name).map_err(bad)?)))
 }
@@ -142,7 +146,7 @@ async fn get_lesson(State(s): State<AppState>, Path(id): Path<i64>) -> AppResult
     Ok(Json(LessonDetail { lesson, unit, counts, cards }))
 }
 
-async fn patch_lesson(State(s): State<AppState>, Path(id): Path<i64>, Json(b): Json<LessonPatchBody>) -> AppResult<Json<Lesson>> {
+async fn patch_lesson(State(s): State<AppState>, Path(id): Path<i64>, Body(b): Body<LessonPatchBody>) -> AppResult<Json<Lesson>> {
     let conn = lock(&s)?;
     repo::update_lesson(&conn, id, b.name.as_deref(), b.unit_id)
         .map_err(bad)?
@@ -191,12 +195,12 @@ async fn get_card(State(s): State<AppState>, Path(id): Path<i64>) -> AppResult<J
     repo::get_card(&conn, id)?.map(Json).ok_or_else(|| AppError::NotFound(format!("card {id} not found")))
 }
 
-async fn create_card(State(s): State<AppState>, Json(b): Json<NewCardBody>) -> AppResult<(StatusCode, Json<Card>)> {
+async fn create_card(State(s): State<AppState>, Body(b): Body<NewCardBody>) -> AppResult<(StatusCode, Json<Card>)> {
     let conn = lock(&s)?;
     Ok((StatusCode::CREATED, Json(repo::create_card(&conn, b.lesson_id, &b.card).map_err(bad)?)))
 }
 
-async fn create_cards_bulk(State(s): State<AppState>, Json(b): Json<BulkBody>) -> AppResult<(StatusCode, Json<BulkResult>)> {
+async fn create_cards_bulk(State(s): State<AppState>, Body(b): Body<BulkBody>) -> AppResult<(StatusCode, Json<BulkResult>)> {
     if b.cards.is_empty() {
         return Err(AppError::BadRequest("no cards to save".into()));
     }
@@ -209,7 +213,7 @@ async fn create_cards_bulk(State(s): State<AppState>, Json(b): Json<BulkBody>) -
     Ok((StatusCode::CREATED, Json(BulkResult { created: ids.len(), ids, lesson })))
 }
 
-async fn patch_card(State(s): State<AppState>, Path(id): Path<i64>, Json(p): Json<CardPatch>) -> AppResult<Json<Card>> {
+async fn patch_card(State(s): State<AppState>, Path(id): Path<i64>, Body(p): Body<CardPatch>) -> AppResult<Json<Card>> {
     let conn = lock(&s)?;
     repo::update_card(&conn, id, &p).map_err(bad)?.map(Json).ok_or_else(|| AppError::NotFound(format!("card {id} not found")))
 }
@@ -237,7 +241,7 @@ struct ReviewBody {
     direction: Option<String>,
 }
 
-async fn study_review(State(s): State<AppState>, Json(b): Json<ReviewBody>) -> AppResult<Json<ReviewResult>> {
+async fn study_review(State(s): State<AppState>, Body(b): Body<ReviewBody>) -> AppResult<Json<ReviewResult>> {
     let grade = Grade::parse(&b.grade).ok_or_else(|| AppError::BadRequest(format!("unknown grade '{}'", b.grade)))?;
     let conn = lock(&s)?;
     repo::apply_review(&conn, b.card_id, grade, b.direction.as_deref())
@@ -262,19 +266,20 @@ struct ExtractResponse {
     hint: String,
 }
 
-async fn extract(State(s): State<AppState>, Json(b): Json<ExtractBody>) -> AppResult<Json<ExtractResponse>> {
+async fn extract(State(s): State<AppState>, Body(b): Body<ExtractBody>) -> AppResult<Json<ExtractResponse>> {
     gemini::validate_images(&b.images).map_err(|e| AppError::BadRequest(e.to_string()))?;
     let hint = b.hint.chars().take(gemini::MAX_HINT_CHARS).collect::<String>();
+    let model = s.gemini_config.model.clone();
+    let api_key = s.gemini_config.api_key.clone().ok_or_else(|| AppError::BadRequest(GeminiError::NoApiKey.to_string()))?;
+    let image_bytes: Vec<usize> = b.images.iter().map(ImageInput::approx_bytes).collect();
 
     // Grab what we need from the DB and apply the safeguards, then release the
     // lock before the slow network call.
-    let (api_key, settings) = {
+    let settings = {
         let conn = lock(&s)?;
         if repo::extraction_paused(&conn)? {
             return Err(AppError::Paused("Extraction is paused – switch it back on in Settings".into()));
         }
-        let key = repo::get_api_key(&conn)?.filter(|k| !k.trim().is_empty()).or_else(|| s.env_api_key.clone());
-        let key = key.ok_or_else(|| AppError::BadRequest(GeminiError::NoApiKey.to_string()))?;
         let settings = repo::get_settings(&conn)?;
 
         let cap = s.limits.extract_per_day;
@@ -287,15 +292,34 @@ async fn extract(State(s): State<AppState>, Json(b): Json<ExtractBody>) -> AppRe
             return Err(AppError::TooManyRequests(format!("Too many extractions in a row – wait {wait}s and try again")));
         }
         let usage = repo::record_extraction(&conn, now)?;
-        tracing::info!(today = usage.today, total = usage.total, cap, model = %settings.gemini_model, images = b.images.len(), "extraction");
-        (key, settings)
+        tracing::info!(today = usage.today, total = usage.total, cap, model = %model, images = b.images.len(), ?image_bytes, hint_chars = hint.chars().count(), "extraction");
+        settings
     };
 
     let req = ExtractRequest { images: &b.images, hint: &hint, front_lang: &settings.front_lang, back_lang: &settings.back_lang };
-    let mut cards = s.gemini.extract(&api_key, &settings.gemini_model, &req).await.map_err(|e| match e {
-        GeminiError::NoApiKey => AppError::BadRequest(e.to_string()),
-        other => AppError::Upstream(other.to_string()),
-    })?;
+    let started = Instant::now();
+    let mut cards = match s.gemini.extract(&api_key, &model, &req).await {
+        Ok(cards) => cards,
+        Err(GeminiError::NoApiKey) => return Err(AppError::BadRequest(GeminiError::NoApiKey.to_string())),
+        Err(e) => {
+            // One chain with everything a reader needs: stage/status (from the
+            // GeminiError Display + its `source`), plus the request shape and
+            // total latency. `AppError::Upstream` logs it with `{:#}` and sends
+            // the same text to the UI.
+            let sizes = image_bytes.iter().map(|b| format!("{} KB", b / 1024)).collect::<Vec<_>>().join(", ");
+            let ctx = format!(
+                "Gemini extraction failed at stage '{}' (model {}, {} image{} [{}], hint {} chars, {} ms)",
+                e.stage(),
+                model,
+                b.images.len(),
+                if b.images.len() == 1 { "" } else { "s" },
+                sizes,
+                hint.chars().count(),
+                started.elapsed().as_millis()
+            );
+            return Err(AppError::Upstream(anyhow::Error::new(e).context(ctx)));
+        }
+    };
 
     // Mark duplicates so the UI can pre-uncheck them.
     {
@@ -310,16 +334,16 @@ async fn extract(State(s): State<AppState>, Json(b): Json<ExtractBody>) -> AppRe
             }
         }
     }
-    Ok(Json(ExtractResponse { cards, model: settings.gemini_model, hint }))
+    tracing::info!(cards = cards.len(), model = %model, latency_ms = started.elapsed().as_millis() as u64, "extraction ok");
+    Ok(Json(ExtractResponse { cards, model, hint }))
 }
 
 // ----- settings / backup ------------------------------------------------------
 
+/// Fill in the read-only, server-side parts of the settings view.
 fn decorate_settings(s: &AppState, mut st: Settings) -> Settings {
-    if !st.gemini_api_key_set && s.env_api_key.is_some() {
-        st.gemini_api_key_set = true;
-        st.gemini_api_key_hint = Some("from GEMINI_API_KEY env".into());
-    }
+    st.gemini_api_key_set = s.gemini_config.api_key.is_some();
+    st.gemini_model = s.gemini_config.model.clone();
     st.extract_daily_cap = s.limits.extract_per_day;
     st
 }
@@ -332,7 +356,7 @@ async fn get_settings(State(s): State<AppState>) -> AppResult<Json<Settings>> {
     Ok(Json(decorate_settings(&s, st)))
 }
 
-async fn patch_settings(State(s): State<AppState>, Json(p): Json<SettingsPatch>) -> AppResult<Json<Settings>> {
+async fn patch_settings(State(s): State<AppState>, Body(p): Body<SettingsPatch>) -> AppResult<Json<Settings>> {
     let st = {
         let conn = lock(&s)?;
         repo::patch_settings(&conn, &p).map_err(bad)?
@@ -345,7 +369,7 @@ async fn export(State(s): State<AppState>) -> AppResult<Json<Backup>> {
     Ok(Json(repo::export(&conn)?))
 }
 
-async fn import(State(s): State<AppState>, Json(b): Json<Backup>) -> AppResult<Json<repo::ImportReport>> {
+async fn import(State(s): State<AppState>, Body(b): Body<Backup>) -> AppResult<Json<repo::ImportReport>> {
     let conn = lock(&s)?;
     Ok(Json(repo::import(&conn, &b).map_err(bad)?))
 }

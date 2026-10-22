@@ -37,7 +37,7 @@ pub fn shared(conn: Connection) -> Db {
     Arc::new(Mutex::new(conn))
 }
 
-const MIGRATIONS: &[&str] = &[
+pub(crate) const MIGRATIONS: &[&str] = &[
     // v1 – initial schema
     "
     CREATE TABLE units (
@@ -88,6 +88,11 @@ const MIGRATIONS: &[&str] = &[
         value TEXT NOT NULL
     );
     ",
+    // v2 – the Gemini key and model are server environment only
+    // (GEMINI_API_KEY / FISZKI_GEMINI_MODEL); drop anything an older build saved.
+    "
+    DELETE FROM settings WHERE key IN ('gemini_api_key', 'gemini_model');
+    ",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<()> {
@@ -95,6 +100,14 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     for (i, sql) in MIGRATIONS.iter().enumerate() {
         let target = (i + 1) as i64;
         if version < target {
+            if target == 2 {
+                let stored: i64 = conn
+                    .query_row("SELECT count(*) FROM settings WHERE key = 'gemini_api_key'", [], |r| r.get(0))
+                    .context("checking for a stored Gemini key before migration 2")?;
+                if stored > 0 {
+                    tracing::warn!("removing the Gemini API key stored in the database – keys now live only in GEMINI_API_KEY (env / .env)");
+                }
+            }
             conn.execute_batch("BEGIN;")?;
             conn.execute_batch(sql)
                 .with_context(|| format!("applying migration {target}"))?;

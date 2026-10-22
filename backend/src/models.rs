@@ -92,10 +92,10 @@ pub struct Settings {
     pub study_direction: String,
     pub new_per_day: i64,
     pub haptics: bool,
+    /// Read-only: `FISZKI_GEMINI_MODEL` on the server (default `gemini-flash-latest`).
     pub gemini_model: String,
+    /// Read-only: whether `GEMINI_API_KEY` is set on the server.
     pub gemini_api_key_set: bool,
-    /// Last four characters of the configured key, for display only.
-    pub gemini_api_key_hint: Option<String>,
     pub last_lesson_id: Option<i64>,
     /// Kill switch for `/api/extract` (persisted).
     pub extraction_paused: bool,
@@ -121,12 +121,13 @@ pub struct SettingsPatch {
     pub study_direction: Option<String>,
     pub new_per_day: Option<i64>,
     pub haptics: Option<bool>,
-    pub gemini_model: Option<String>,
-    /// Empty string clears the key.
-    pub gemini_api_key: Option<String>,
     pub last_lesson_id: Option<i64>,
     pub extraction_paused: Option<bool>,
     pub theme: Option<String>,
+    /// Not settable from the app (server env only). Kept so that an old client
+    /// or a stolen Basic-auth session gets an explicit 400 instead of a silent no-op.
+    pub gemini_model: Option<String>,
+    pub gemini_api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

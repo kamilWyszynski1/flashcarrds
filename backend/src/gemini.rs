@@ -3,6 +3,12 @@
 //! The API key never leaves the server: the browser uploads the (downscaled)
 //! image here, and this module calls the Generative Language REST API with
 //! structured (JSON-schema) output so the result is machine-parseable.
+//!
+//! Key and model are server configuration only (`GEMINI_API_KEY`,
+//! `FISZKI_GEMINI_MODEL`); they are deliberately not editable from the app so
+//! that a leaked Basic-auth password cannot be used to swap or read them.
+
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -12,12 +18,87 @@ use crate::models::ExtractedCard;
 
 pub const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 
+/// `gemini-flash-latest` is an alias Google keeps pointing at the current
+/// Flash model, so a fresh install works without knowing today's version.
+pub const DEFAULT_MODEL: &str = "gemini-flash-latest";
+
+/// Upper bound for one Gemini call. Extraction normally takes 2–8 s; anything
+/// longer is the model being overloaded and the UI should say so instead of
+/// spinning. Overridable with `FISZKI_GEMINI_TIMEOUT_SECS`.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A `503 UNAVAILABLE` ("high demand") that comes back this quickly is worth
+/// one automatic retry; a slow failure already ate the user's patience.
+const RETRY_IF_FASTER_THAN: Duration = Duration::from_secs(10);
+/// Pause before the retry (scaled down to `timeout / 10` for short timeouts).
+const RETRY_BACKOFF: Duration = Duration::from_millis(1500);
+/// Do not bother retrying if less than this is left of the per-call budget.
+const MIN_RETRY_BUDGET: Duration = Duration::from_millis(500);
+
+/// How much of an upstream body we keep for logs / error chains. Gemini's own
+/// error message lives in the first few hundred bytes; 2 KB also covers the
+/// `details` block without flooding the log with a 100 KB answer.
+pub const BODY_LOG_LIMIT: usize = 2048;
+
+/// Accept `gemini-2.5-flash`, `models/gemini-flash-latest`, etc.; reject
+/// anything that cannot be a model id so a typo fails at startup with a clear
+/// message rather than as a 404 from Gemini.
+pub fn clean_model(m: &str) -> Result<String> {
+    let m = m.trim();
+    let m = m.strip_prefix("models/").unwrap_or(m);
+    if m.is_empty() {
+        return Err(anyhow!("model name must not be empty"));
+    }
+    if m.len() > 80 {
+        return Err(anyhow!("model name is too long (max 80 characters)"));
+    }
+    if !m.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_')) {
+        return Err(anyhow!("model name may only contain letters, digits, '-', '.' and '_' (e.g. {DEFAULT_MODEL})"));
+    }
+    Ok(m.to_string())
+}
+
+/// Server-side Gemini configuration (env only – see module docs).
+#[derive(Debug, Clone)]
+pub struct GeminiConfig {
+    /// `GEMINI_API_KEY`; `None` disables extraction with a clear 400.
+    pub api_key: Option<String>,
+    /// `FISZKI_GEMINI_MODEL`, already validated with [`clean_model`].
+    pub model: String,
+}
+
+impl Default for GeminiConfig {
+    fn default() -> Self {
+        GeminiConfig { api_key: None, model: DEFAULT_MODEL.to_string() }
+    }
+}
+
+impl GeminiConfig {
+    /// Read `GEMINI_API_KEY` and `FISZKI_GEMINI_MODEL`; a malformed model name
+    /// is a startup error (better than every extraction failing with a 404).
+    pub fn from_env() -> Result<Self> {
+        let api_key = std::env::var("GEMINI_API_KEY").ok().map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
+        let model = match std::env::var("FISZKI_GEMINI_MODEL") {
+            Ok(m) if !m.trim().is_empty() => clean_model(&m).map_err(|e| anyhow!("FISZKI_GEMINI_MODEL: {e}"))?,
+            _ => DEFAULT_MODEL.to_string(),
+        };
+        Ok(GeminiConfig { api_key, model })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageInput {
     /// e.g. "image/jpeg"
     pub mime_type: String,
     /// base64 (no data: prefix)
     pub data: String,
+}
+
+impl ImageInput {
+    /// Approximate decoded size in bytes (base64 → raw).
+    pub fn approx_bytes(&self) -> usize {
+        self.data.len() * 3 / 4
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -28,15 +109,90 @@ pub struct ExtractRequest<'a> {
     pub back_lang: &'a str,
 }
 
-/// Errors that the UI should show verbatim (configuration / upstream problems).
+/// Why one Gemini call failed. Every variant names the stage, carries the
+/// latency, and (where there was an answer) the upstream status and the first
+/// [`BODY_LOG_LIMIT`] bytes of the body – so one log line is enough to see what
+/// Gemini actually said. The `Display` text is safe to show in the UI (it never
+/// contains the key; the key travels in a header, not the URL).
 #[derive(Debug, thiserror::Error)]
 pub enum GeminiError {
-    #[error("Gemini API key is not configured – add it in Settings")]
+    #[error("Gemini API key is not configured – set GEMINI_API_KEY on the server")]
     NoApiKey,
-    #[error("Gemini request failed: {0}")]
-    Upstream(String),
-    #[error("Could not understand Gemini's answer: {0}")]
-    BadResponse(String),
+    /// The request never completed: DNS / connect / TLS / timeout / reset.
+    #[error("{} after {} ms", if .source.is_timeout() { "no answer from Gemini" } else { "could not reach Gemini" }, .elapsed.as_millis())]
+    Transport {
+        /// "sending request" | "reading response"
+        stage: &'static str,
+        elapsed: Duration,
+        #[source]
+        source: reqwest::Error,
+    },
+    /// Gemini answered with a non-2xx.
+    #[error("Gemini answered HTTP {status}{}: {message}", .api_status.as_deref().map(|s| format!(" {s}")).unwrap_or_default())]
+    Status {
+        status: u16,
+        /// `error.status` from the body, e.g. "UNAVAILABLE", "INVALID_ARGUMENT".
+        api_status: Option<String>,
+        /// `error.message` from the body, or the raw (truncated) body.
+        message: String,
+        /// Raw body, truncated to [`BODY_LOG_LIMIT`].
+        body: String,
+        elapsed: Duration,
+    },
+    /// 2xx, but the body was not something we can turn into cards.
+    #[error("could not understand Gemini's answer: {reason}")]
+    BadResponse {
+        reason: String,
+        /// Raw body, truncated to [`BODY_LOG_LIMIT`].
+        body: String,
+        elapsed: Duration,
+    },
+}
+
+impl GeminiError {
+    /// Short stage tag for structured logs.
+    pub fn stage(&self) -> &'static str {
+        match self {
+            GeminiError::NoApiKey => "config",
+            GeminiError::Transport { stage, .. } => stage,
+            GeminiError::Status { .. } => "upstream_status",
+            GeminiError::BadResponse { .. } => "parse",
+        }
+    }
+
+    pub fn upstream_status(&self) -> Option<u16> {
+        match self {
+            GeminiError::Status { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+
+    /// Truncated upstream body, when there was one.
+    pub fn body(&self) -> Option<&str> {
+        match self {
+            GeminiError::Status { body, .. } | GeminiError::BadResponse { body, .. } => Some(body),
+            _ => None,
+        }
+    }
+
+    pub fn elapsed(&self) -> Option<Duration> {
+        match self {
+            GeminiError::NoApiKey => None,
+            GeminiError::Transport { elapsed, .. } | GeminiError::Status { elapsed, .. } | GeminiError::BadResponse { elapsed, .. } => Some(*elapsed),
+        }
+    }
+}
+
+/// Keep the first `limit` bytes of `s` (on a char boundary), marking the cut.
+pub fn truncate_body(s: &str, limit: usize) -> String {
+    if s.len() <= limit {
+        return s.to_string();
+    }
+    let mut end = limit;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… [{} bytes total]", &s[..end], s.len())
 }
 
 pub fn build_prompt(front_lang: &str, back_lang: &str, hint: &str) -> String {
@@ -101,14 +257,13 @@ pub fn build_request_body(req: &ExtractRequest<'_>) -> Value {
     })
 }
 
-/// Pull the card list out of a `generateContent` response.
-pub fn parse_response(v: &Value) -> Result<Vec<ExtractedCard>, GeminiError> {
+/// Pull the card list out of a `generateContent` response. `Err` is the reason
+/// (the caller attaches the raw body and latency).
+pub fn parse_response(v: &Value) -> Result<Vec<ExtractedCard>, String> {
     if let Some(reason) = v.pointer("/promptFeedback/blockReason").and_then(Value::as_str) {
-        return Err(GeminiError::Upstream(format!("request was blocked ({reason})")));
+        return Err(format!("request was blocked by Gemini ({reason})"));
     }
-    let candidate = v
-        .pointer("/candidates/0")
-        .ok_or_else(|| GeminiError::BadResponse("no candidates in response".into()))?;
+    let candidate = v.pointer("/candidates/0").ok_or_else(|| "no candidates in response".to_string())?;
     let text: String = candidate
         .pointer("/content/parts")
         .and_then(Value::as_array)
@@ -116,17 +271,16 @@ pub fn parse_response(v: &Value) -> Result<Vec<ExtractedCard>, GeminiError> {
         .unwrap_or_default();
     if text.trim().is_empty() {
         let finish = candidate.get("finishReason").and_then(Value::as_str).unwrap_or("unknown");
-        return Err(GeminiError::BadResponse(format!("empty answer (finishReason: {finish})")));
+        return Err(format!("empty answer (finishReason: {finish})"));
     }
-    let parsed: Value = serde_json::from_str(strip_code_fence(&text))
-        .map_err(|e| GeminiError::BadResponse(format!("answer was not valid JSON: {e}")))?;
+    let parsed: Value = serde_json::from_str(strip_code_fence(&text)).map_err(|e| format!("answer was not valid JSON: {e}"))?;
     let cards = match parsed {
         Value::Array(a) => a,
         Value::Object(mut o) => match o.remove("cards") {
             Some(Value::Array(a)) => a,
-            _ => return Err(GeminiError::BadResponse("answer has no \"cards\" array".into())),
+            _ => return Err("answer has no \"cards\" array".into()),
         },
-        _ => return Err(GeminiError::BadResponse("answer has unexpected shape".into())),
+        _ => return Err("answer has unexpected shape".into()),
     };
     let mut out = Vec::new();
     for c in cards {
@@ -149,46 +303,145 @@ fn strip_code_fence(s: &str) -> &str {
     t.trim()
 }
 
+/// `(error.status, error.message)` from a Gemini error body, if it is one.
+fn parse_error_body(text: &str) -> (Option<String>, Option<String>) {
+    match serde_json::from_str::<Value>(text) {
+        Ok(v) => (
+            v.pointer("/error/status").and_then(Value::as_str).map(String::from),
+            v.pointer("/error/message").and_then(Value::as_str).map(String::from),
+        ),
+        Err(_) => (None, None),
+    }
+}
+
 #[derive(Clone)]
 pub struct GeminiClient {
     http: reqwest::Client,
     base_url: String,
+    timeout: Duration,
 }
 
 impl GeminiClient {
     pub fn new(base_url: Option<String>) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(90))
-            .build()
-            .expect("reqwest client");
-        GeminiClient { http, base_url: base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()) }
+        Self::with_timeout(base_url, DEFAULT_TIMEOUT)
     }
 
+    /// `timeout` bounds one HTTP attempt (connect + send + first byte + body).
+    pub fn with_timeout(base_url: Option<String>, timeout: Duration) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(timeout)
+            .connect_timeout(Duration::from_secs(10).min(timeout))
+            .build()
+            .expect("reqwest client");
+        GeminiClient { http, base_url: base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()), timeout }
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// One extraction. Logs the attempt at `debug`, the outcome at `info`
+    /// (success) or `warn` (failure, with upstream status and truncated body),
+    /// and retries a *fast* `503` once – the usual "high demand" answer. The
+    /// retry only gets what is left of the per-call budget, so the whole call
+    /// stays within `timeout` (+ a short backoff).
     pub async fn extract(&self, api_key: &str, model: &str, req: &ExtractRequest<'_>) -> Result<Vec<ExtractedCard>, GeminiError> {
         if api_key.trim().is_empty() {
             return Err(GeminiError::NoApiKey);
         }
         let url = format!("{}/models/{}:generateContent", self.base_url.trim_end_matches('/'), model);
         let body = build_request_body(req);
+        let body_bytes = serde_json::to_vec(&body).map(|b| b.len()).unwrap_or(0);
+        let image_bytes: Vec<usize> = req.images.iter().map(ImageInput::approx_bytes).collect();
+        tracing::debug!(
+            model,
+            url = %url,
+            images = req.images.len(),
+            ?image_bytes,
+            body_bytes,
+            hint_chars = req.hint.chars().count(),
+            timeout_ms = self.timeout.as_millis() as u64,
+            "gemini: sending generateContent"
+        );
+
+        let started = Instant::now();
+        let backoff = RETRY_BACKOFF.min(self.timeout / 10);
+        let mut attempt = 1u32;
+        let mut attempt_timeout = self.timeout;
+        loop {
+            let res = self.attempt(&url, api_key, &body, attempt_timeout).await;
+            match res {
+                Ok((cards, elapsed, finish)) => {
+                    tracing::info!(model, attempt, cards = cards.len(), latency_ms = elapsed.as_millis() as u64, finish_reason = %finish, "gemini: ok");
+                    return Ok(cards);
+                }
+                Err(e) => {
+                    let remaining = self.timeout.saturating_sub(started.elapsed() + backoff);
+                    let retry = attempt == 1
+                        && e.upstream_status() == Some(503)
+                        && e.elapsed().map(|d| d < RETRY_IF_FASTER_THAN).unwrap_or(false)
+                        && remaining >= MIN_RETRY_BUDGET;
+                    tracing::warn!(
+                        model,
+                        attempt,
+                        stage = e.stage(),
+                        upstream_status = e.upstream_status(),
+                        latency_ms = e.elapsed().map(|d| d.as_millis() as u64),
+                        images = req.images.len(),
+                        ?image_bytes,
+                        body = e.body(),
+                        error = %crate::error::chain(&e),
+                        will_retry = retry,
+                        retry_budget_ms = remaining.as_millis() as u64,
+                        "gemini: request failed"
+                    );
+                    if !retry {
+                        return Err(e);
+                    }
+                    tokio::time::sleep(backoff).await;
+                    attempt += 1;
+                    attempt_timeout = remaining;
+                }
+            }
+        }
+    }
+
+    /// One HTTP round-trip bounded by `timeout`; `Ok` carries (cards, latency, finishReason).
+    async fn attempt(&self, url: &str, api_key: &str, body: &Value, timeout: Duration) -> Result<(Vec<ExtractedCard>, Duration, String), GeminiError> {
+        let t0 = Instant::now();
         let resp = self
             .http
-            .post(&url)
+            .post(url)
+            .timeout(timeout)
             .header("x-goog-api-key", api_key)
-            .json(&body)
+            .json(body)
             .send()
             .await
-            .map_err(|e| GeminiError::Upstream(format!("network error: {e}")))?;
+            .map_err(|source| GeminiError::Transport { stage: "sending request", elapsed: t0.elapsed(), source })?;
         let status = resp.status();
-        let text = resp.text().await.map_err(|e| GeminiError::Upstream(format!("reading response: {e}")))?;
+        let text = resp
+            .text()
+            .await
+            .map_err(|source| GeminiError::Transport { stage: "reading response", elapsed: t0.elapsed(), source })?;
+        let elapsed = t0.elapsed();
         if !status.is_success() {
-            let msg = serde_json::from_str::<Value>(&text)
-                .ok()
-                .and_then(|v| v.pointer("/error/message").and_then(Value::as_str).map(String::from))
-                .unwrap_or_else(|| text.chars().take(300).collect());
-            return Err(GeminiError::Upstream(format!("HTTP {}: {}", status.as_u16(), msg)));
+            let (api_status, message) = parse_error_body(&text);
+            return Err(GeminiError::Status {
+                status: status.as_u16(),
+                api_status,
+                message: message.unwrap_or_else(|| truncate_body(text.trim(), 300)),
+                body: truncate_body(&text, BODY_LOG_LIMIT),
+                elapsed,
+            });
         }
-        let v: Value = serde_json::from_str(&text).map_err(|e| GeminiError::BadResponse(format!("not JSON: {e}")))?;
-        parse_response(&v)
+        let v: Value = serde_json::from_str(&text).map_err(|e| GeminiError::BadResponse {
+            reason: format!("not JSON: {e}"),
+            body: truncate_body(&text, BODY_LOG_LIMIT),
+            elapsed,
+        })?;
+        let finish = v.pointer("/candidates/0/finishReason").and_then(Value::as_str).unwrap_or("-").to_string();
+        let cards = parse_response(&v).map_err(|reason| GeminiError::BadResponse { reason, body: truncate_body(&text, BODY_LOG_LIMIT), elapsed })?;
+        Ok((cards, elapsed, finish))
     }
 }
 
@@ -280,15 +533,76 @@ mod tests {
     #[test]
     fn reports_blocked_empty_and_malformed() {
         let blocked = json!({"promptFeedback":{"blockReason":"SAFETY"}});
-        assert!(matches!(parse_response(&blocked), Err(GeminiError::Upstream(_))));
+        assert!(parse_response(&blocked).unwrap_err().contains("blocked by Gemini (SAFETY)"));
         let empty = json!({"candidates":[{"content":{"parts":[]},"finishReason":"MAX_TOKENS"}]});
-        let e = parse_response(&empty).unwrap_err().to_string();
+        let e = parse_response(&empty).unwrap_err();
         assert!(e.contains("MAX_TOKENS"), "{e}");
         let bad = json!({"candidates":[{"content":{"parts":[{"text":"not json"}]}}]});
-        assert!(matches!(parse_response(&bad), Err(GeminiError::BadResponse(_))));
+        assert!(parse_response(&bad).unwrap_err().contains("not valid JSON"));
         let no_cards = json!({"candidates":[{"content":{"parts":[{"text":"{\"foo\":1}"}]}}]});
-        assert!(matches!(parse_response(&no_cards), Err(GeminiError::BadResponse(_))));
-        assert!(matches!(parse_response(&json!({})), Err(GeminiError::BadResponse(_))));
+        assert!(parse_response(&no_cards).unwrap_err().contains("cards"));
+        assert!(parse_response(&json!({})).unwrap_err().contains("no candidates"));
+    }
+
+    #[test]
+    fn model_name_is_validated() {
+        assert_eq!(clean_model(" models/gemini-2.5-flash ").unwrap(), "gemini-2.5-flash", "prefix stripped, trimmed");
+        assert_eq!(clean_model("gemini-2.0-flash_exp.v1").unwrap(), "gemini-2.0-flash_exp.v1");
+        let e = clean_model("gemini flash; drop").unwrap_err().to_string();
+        assert!(e.contains(DEFAULT_MODEL), "{e}");
+        assert!(clean_model("x".repeat(81).as_str()).is_err());
+        assert!(clean_model("models/").is_err());
+        assert!(clean_model("").is_err());
+        assert_eq!(GeminiConfig::default().model, DEFAULT_MODEL);
+        assert!(GeminiConfig::default().api_key.is_none());
+    }
+
+    #[test]
+    fn body_truncation_keeps_char_boundaries() {
+        assert_eq!(truncate_body("short", 10), "short");
+        let t = truncate_body("ąąąąą", 3); // each 'ą' is 2 bytes → cut at 2
+        assert!(t.starts_with("ą…"), "{t}");
+        assert!(t.contains("[10 bytes total]"), "{t}");
+        let long = "x".repeat(BODY_LOG_LIMIT + 5);
+        let t = truncate_body(&long, BODY_LOG_LIMIT);
+        assert!(t.len() < long.len() + 30 && t.ends_with("bytes total]"));
+    }
+
+    #[test]
+    fn error_display_names_stage_status_and_message() {
+        let e = GeminiError::Status {
+            status: 503,
+            api_status: Some("UNAVAILABLE".into()),
+            message: "This model is currently experiencing high demand.".into(),
+            body: "{...}".into(),
+            elapsed: Duration::from_millis(2200),
+        };
+        assert_eq!(e.to_string(), "Gemini answered HTTP 503 UNAVAILABLE: This model is currently experiencing high demand.");
+        assert_eq!(e.stage(), "upstream_status");
+        assert_eq!(e.upstream_status(), Some(503));
+        assert_eq!(e.body(), Some("{...}"));
+        assert_eq!(e.elapsed(), Some(Duration::from_millis(2200)));
+
+        let e = GeminiError::Status { status: 500, api_status: None, message: "<html>".into(), body: String::new(), elapsed: Duration::ZERO };
+        assert_eq!(e.to_string(), "Gemini answered HTTP 500: <html>");
+
+        let e = GeminiError::BadResponse { reason: "answer has no \"cards\" array".into(), body: "{}".into(), elapsed: Duration::ZERO };
+        assert_eq!(e.to_string(), "could not understand Gemini's answer: answer has no \"cards\" array");
+        assert_eq!(e.stage(), "parse");
+        assert!(e.upstream_status().is_none());
+
+        assert_eq!(GeminiError::NoApiKey.stage(), "config");
+        assert!(GeminiError::NoApiKey.to_string().contains("GEMINI_API_KEY"));
+        assert!(GeminiError::NoApiKey.elapsed().is_none());
+    }
+
+    #[test]
+    fn upstream_error_body_is_parsed_for_status_and_message() {
+        let (st, msg) = parse_error_body(r#"{"error":{"code":503,"message":"busy","status":"UNAVAILABLE"}}"#);
+        assert_eq!(st.as_deref(), Some("UNAVAILABLE"));
+        assert_eq!(msg.as_deref(), Some("busy"));
+        assert_eq!(parse_error_body("<html>502</html>"), (None, None));
+        assert_eq!(parse_error_body(r#"{"error":"flat"}"#), (None, None));
     }
 
     #[test]

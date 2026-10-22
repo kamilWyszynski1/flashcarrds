@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { Icon } from '../components/Icon';
 import { Button, Chip, ErrorBox, Footer, GroupSelector, Label, Spinner, TopBar, fieldClass } from '../components/ui';
-import { api, ApiError } from '../lib/api';
+import { api } from '../lib/api';
+import { describeExtractError } from '../lib/extractError';
 import { fmtBytes, prepareImage, type PreparedImage } from '../lib/image';
 import { markCaptureFlowStart, useSheets } from '../lib/sheets';
 import { useStore, useTargetLesson } from '../lib/store';
@@ -76,10 +77,14 @@ export function Capture() {
     });
   };
 
+  // The server gives Gemini ~30 s (one retry on a fast 503), so a request that
+  // is still pending after this long is stuck somewhere; stop spinning and say so.
+  const CLIENT_TIMEOUT_MS = 60_000;
+
   const extract = async () => {
     if (images.length === 0) return;
     if (!settings?.gemini_api_key_set) {
-      setError('Add your Gemini API key in Settings first.');
+      setError('The server has no Gemini API key – set GEMINI_API_KEY in its .env and restart it.');
       return;
     }
     localStorage.setItem(HINT_KEY, hint);
@@ -87,14 +92,19 @@ export function Capture() {
     setPhase('uploading');
     const ac = new AbortController();
     abortRef.current = ac;
+    let timedOut = false;
     const t = setTimeout(() => setPhase('extracting'), 900);
+    const guard = setTimeout(() => {
+      timedOut = true;
+      ac.abort();
+    }, CLIENT_TIMEOUT_MS);
+    const started = Date.now();
     try {
       const res = await api.extract(
         images.map((i) => ({ mime_type: i.mime_type, data: i.data })),
         hint,
         ac.signal,
       );
-      clearTimeout(t);
       lastImages = images;
       setDraft({
         source: 'photo',
@@ -107,11 +117,14 @@ export function Capture() {
       // On retry this screen replaced the Review entry, so replace it back.
       navigate('/review', { replace: retry });
     } catch (e) {
-      clearTimeout(t);
-      if ((e as Error).name === 'AbortError') return;
-      const msg = e instanceof ApiError && e.status === 502 ? `Gemini could not process the photo. ${e.message}` : (e as Error).message;
-      setError(msg);
+      if ((e as Error).name === 'AbortError') {
+        if (timedOut) setError(`No answer from the server after ${Math.round((Date.now() - started) / 1000)} s – it may be overloaded. Try again in a minute.`);
+        return;
+      }
+      setError(describeExtractError(e));
     } finally {
+      clearTimeout(t);
+      clearTimeout(guard);
       setPhase('idle');
       abortRef.current = null;
     }
@@ -127,7 +140,7 @@ export function Capture() {
       <div className="min-h-dvh bg-surface flex flex-col items-center justify-center text-center px-6">
         <Spinner className="w-16 h-16 border-[5px] mb-6" />
         <h2 className="font-display text-headline-md text-on-surface">Reading the page…</h2>
-        <div className="text-body-sm text-on-surface-variant mt-1.5">Usually 3–8 seconds</div>
+        <div className="text-body-sm text-on-surface-variant mt-1.5">Usually 3–8 seconds · gives up after about 30 s</div>
         <div className="mt-6 flex flex-col gap-2.5 text-left text-body-md text-on-surface-variant">
           <Step done>Photo compressed ({images.map((i) => `${fmtBytes(i.originalBytes)} → ${fmtBytes(i.bytes)}`).join(', ')})</Step>
           <Step done={phase === 'extracting'}>Uploaded</Step>
@@ -231,11 +244,11 @@ export function Capture() {
           <div className="mt-4 rounded-xl bg-secondary-fixed/60 text-on-secondary-fixed p-3.5 text-body-sm flex gap-3 items-start">
             <Icon name="key" size={20} />
             <div>
-              Photo extraction needs a Gemini API key.{' '}
+              The server has no Gemini API key, so photo extraction is off. Add <code>GEMINI_API_KEY</code> to the server’s <code>.env</code> and restart it (status in{' '}
               <button type="button" className="font-semibold underline" onClick={() => navigate('/settings')}>
-                Add it in Settings
+                Settings
               </button>
-              .
+              ).
             </div>
           </div>
         )}

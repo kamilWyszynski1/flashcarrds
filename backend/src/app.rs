@@ -10,7 +10,8 @@ use tower_http::{
 };
 
 use crate::db::Db;
-use crate::gemini::{GeminiClient, MAX_REQUEST_BYTES};
+use crate::error;
+use crate::gemini::{GeminiClient, GeminiConfig, MAX_REQUEST_BYTES};
 use crate::guard::{self, Limits, RateLimiter};
 use crate::routes;
 
@@ -18,8 +19,8 @@ use crate::routes;
 pub struct AppState {
     pub db: Db,
     pub gemini: GeminiClient,
-    /// Fallback API key from the environment (the one stored in Settings wins).
-    pub env_api_key: Option<String>,
+    /// API key and model – environment only, never stored or editable via the API.
+    pub gemini_config: GeminiConfig,
     pub limits: Limits,
     pub extract_limiter: RateLimiter,
     /// Expected `Authorization` header value (`Basic …`); `None` = no auth.
@@ -27,14 +28,14 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(db: Db, gemini: GeminiClient, env_api_key: Option<String>, limits: Limits, basic_auth: Option<String>) -> Self {
-        AppState { db, gemini, env_api_key, limits, extract_limiter: RateLimiter::new(limits.extract_per_minute), basic_auth }
+    pub fn new(db: Db, gemini: GeminiClient, gemini_config: GeminiConfig, limits: Limits, basic_auth: Option<String>) -> Self {
+        AppState { db, gemini, gemini_config, limits, extract_limiter: RateLimiter::new(limits.extract_per_minute), basic_auth }
     }
 }
 
 /// Build the full application: `/api/*` plus the static PWA with SPA fallback.
 pub fn build_app(state: AppState, static_dir: Option<PathBuf>) -> Router {
-    let api = routes::api_router().layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES));
+    let api = routes::api_router().fallback(error::api_not_found).layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES));
     let mut app = Router::new().nest("/api", api);
     if let Some(dir) = static_dir {
         let index = dir.join("index.html");
@@ -50,5 +51,8 @@ pub fn build_app(state: AppState, static_dir: Option<PathBuf>) -> Router {
         let expected: Arc<str> = Arc::from(expected);
         app = app.layer(middleware::from_fn_with_state(expected, guard::require_basic_auth));
     }
-    app.layer(TraceLayer::new_for_http())
+    // Outermost after tracing: anything non-2xx that did not come from an
+    // `AppError` (auth 401, 404, extractor rejections) still gets our own log
+    // line, so `tower_http`'s `on_failure` is never the only evidence.
+    app.layer(middleware::from_fn(error::log_failures)).layer(TraceLayer::new_for_http())
 }

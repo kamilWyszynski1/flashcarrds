@@ -10,18 +10,24 @@ use axum::{
 };
 use fiszki_server::app::{build_app, AppState};
 use fiszki_server::db;
-use fiszki_server::gemini::GeminiClient;
+use fiszki_server::gemini::{GeminiClient, GeminiConfig};
 use fiszki_server::guard::Limits;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tower::ServiceExt;
 
 const UNLIMITED: Limits = Limits { extract_per_minute: 0, extract_per_day: 0 };
 
 fn app_full(base_url: Option<String>, env_key: Option<&str>, limits: Limits, basic_auth: Option<String>) -> Router {
+    app_custom(GeminiClient::new(base_url), env_key, None, limits, basic_auth)
+}
+
+fn app_custom(gemini: GeminiClient, env_key: Option<&str>, model: Option<&str>, limits: Limits, basic_auth: Option<String>) -> Router {
     let conn = db::open(None).unwrap();
-    let state = AppState::new(db::shared(conn), GeminiClient::new(base_url), env_key.map(String::from), limits, basic_auth);
+    let cfg = GeminiConfig { api_key: env_key.map(String::from), model: model.map(String::from).unwrap_or_else(|| GeminiConfig::default().model) };
+    let state = AppState::new(db::shared(conn), gemini, cfg, limits, basic_auth);
     build_app(state, None)
 }
 
@@ -200,22 +206,46 @@ async fn study_queue_and_review_flow() {
 }
 
 #[tokio::test]
-async fn settings_mask_key_and_env_fallback() {
+async fn settings_expose_server_key_and_model_read_only() {
     let app = app();
     let (_, s) = call(&app, "GET", "/api/settings", None).await;
     assert_eq!(s["gemini_api_key_set"], false);
-    assert_eq!(s["front_lang"], "Español");
-    let (st, s) = call(&app, "PATCH", "/api/settings", Some(json!({"gemini_api_key": "AIzaSecret9876", "front_lang": "Polski", "back_lang": "English"}))).await;
-    assert_eq!(st, StatusCode::OK, "{s}");
-    assert_eq!(s["gemini_api_key_set"], true);
-    assert_eq!(s["gemini_api_key_hint"], "…9876");
+    assert_eq!(s["gemini_model"], "gemini-flash-latest", "default must be a currently served alias");
     assert!(s.get("gemini_api_key").is_none(), "key must never be returned");
+    assert!(s.get("gemini_api_key_hint").is_none(), "nothing about the key is returned");
+    assert_eq!(s["front_lang"], "Español");
+    let (st, s) = call(&app, "PATCH", "/api/settings", Some(json!({"front_lang": "Polski", "back_lang": "English"}))).await;
+    assert_eq!(st, StatusCode::OK, "{s}");
     assert_eq!(s["front_lang"], "Polski");
     let (st, _) = call(&app, "PATCH", "/api/settings", Some(json!({"study_direction": "diagonal"}))).await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
 
-    let app_env = app_with(None, Some("env-key"));
+    // Key / model cannot be set from the app – even with a valid session – and
+    // such a request must not apply its other fields either.
+    for body in [
+        json!({"gemini_api_key": "AIzaSecret9876", "front_lang": "Deutsch"}),
+        json!({"gemini_api_key": ""}),
+        json!({"gemini_model": "gemini-2.5-pro"}),
+        json!({"gemini_model": ""}),
+    ] {
+        let (st, v) = call(&app, "PATCH", "/api/settings", Some(body)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+        assert!(v["message"].as_str().unwrap().contains("GEMINI_API_KEY"), "{v}");
+    }
+    let (_, s) = call(&app, "GET", "/api/settings", None).await;
+    assert_eq!(s["front_lang"], "Polski", "rejected patch changed nothing");
+    assert_eq!(s["gemini_api_key_set"], false);
+    assert_eq!(s["gemini_model"], "gemini-flash-latest");
+
+    // Env-configured server reports it, read-only.
+    let app_env = app_custom(GeminiClient::new(None), Some("env-key"), Some("gemini-2.5-flash-lite"), UNLIMITED, None);
     let (_, s) = call(&app_env, "GET", "/api/settings", None).await;
+    assert_eq!(s["gemini_api_key_set"], true);
+    assert_eq!(s["gemini_model"], "gemini-2.5-flash-lite");
+    let (st, _) = call(&app_env, "PATCH", "/api/settings", Some(json!({"gemini_api_key": "other"}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (_, s) = call(&app_env, "PATCH", "/api/settings", Some(json!({"extraction_paused": true}))).await;
+    assert_eq!(s["gemini_model"], "gemini-2.5-flash-lite", "patch response is decorated too");
     assert_eq!(s["gemini_api_key_set"], true);
 }
 
@@ -244,7 +274,12 @@ async fn export_then_import_into_fresh_db() {
 #[derive(Clone, Default)]
 struct FakeGemini {
     requests: Arc<Mutex<Vec<(String, Value)>>>,
+    /// Fixed reply for every request (after `queue` is drained); `None` = canned success.
     reply: Arc<Mutex<Option<(u16, Value)>>>,
+    /// One-shot replies, consumed in order before `reply` is consulted.
+    queue: Arc<Mutex<Vec<(u16, Value)>>>,
+    /// Artificial latency before answering.
+    delay: Arc<Mutex<Duration>>,
 }
 
 async fn fake_generate(
@@ -255,7 +290,22 @@ async fn fake_generate(
 ) -> (StatusCode, Json<Value>) {
     let key = headers.get("x-goog-api-key").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
     f.requests.lock().unwrap().push((format!("{model}|{key}"), body));
-    let (code, v) = f.reply.lock().unwrap().clone().unwrap_or((
+    let queued = {
+        let mut q = f.queue.lock().unwrap();
+        if q.is_empty() {
+            None
+        } else {
+            Some(q.remove(0))
+        }
+    };
+    // Queued one-shot replies are instant; `delay` models a slow steady state.
+    if queued.is_none() {
+        let delay = *f.delay.lock().unwrap();
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+    }
+    let (code, v) = queued.or_else(|| f.reply.lock().unwrap().clone()).unwrap_or((
         200,
         json!({"candidates":[{"content":{"parts":[{"text": json!({"cards":[
             {"front":"hace sol","back":"jest słonecznie","confidence":0.95},
@@ -278,21 +328,27 @@ async fn start_fake_gemini() -> (String, FakeGemini) {
     (format!("http://{addr}/v1beta"), fake)
 }
 
+/// The real "high demand" answer `gemini-flash-latest` returned on 2026-10-22.
+fn unavailable_body() -> Value {
+    json!({"error": {"code": 503, "message": "This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.", "status": "UNAVAILABLE",
+        "details": [{"@type": "type.googleapis.com/google.rpc.DebugInfo", "detail": "[ORIGINAL ERROR] generic::unavailable: Overloaded prefill queue."}]}})
+}
+
 #[tokio::test]
 async fn extract_requires_key_validates_images_and_marks_duplicates() {
     let (base, fake) = start_fake_gemini().await;
-    let app = app_with(Some(base), None);
+
+    // No key configured → 400 with actionable message, nothing reaches Gemini.
+    let no_key = app_with(Some(base.clone()), None);
+    let img = json!({"mime_type": "image/jpeg", "data": "/9j/4AAQ"});
+    let (s, v) = call(&no_key, "POST", "/api/extract", Some(json!({"images": [img], "hint": "only the box"}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v["message"].as_str().unwrap().contains("GEMINI_API_KEY"), "{v}");
+    assert_eq!(fake.requests.lock().unwrap().len(), 0);
+
+    let app = app_custom(GeminiClient::new(Some(base)), Some("test-key"), Some("gemini-test"), UNLIMITED, None);
     let (_u, lesson_id) = seed(&app).await;
     call(&app, "POST", "/api/cards/bulk", Some(json!({"lesson_id": lesson_id, "cards": [{"front": "el paraguas", "back": "parasol"}]}))).await;
-
-    let img = json!({"mime_type": "image/jpeg", "data": "/9j/4AAQ"});
-
-    // No key configured → 400 with actionable message.
-    let (s, v) = call(&app, "POST", "/api/extract", Some(json!({"images": [img], "hint": "only the box"}))).await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
-    assert!(v["message"].as_str().unwrap().contains("Settings"));
-
-    call(&app, "PATCH", "/api/settings", Some(json!({"gemini_api_key": "test-key", "gemini_model": "gemini-test"}))).await;
 
     // Bad images.
     let (s, _) = call(&app, "POST", "/api/extract", Some(json!({"images": [], "hint": ""}))).await;
@@ -322,27 +378,119 @@ async fn extract_requires_key_validates_images_and_marks_duplicates() {
     assert_eq!(body["contents"][0]["parts"][1]["inline_data"]["mime_type"], "image/jpeg");
     assert_eq!(body["generationConfig"]["response_mime_type"], "application/json");
 
-    // Upstream errors surface as 502 with Gemini's message.
-    *fake.reply.lock().unwrap() = Some((429, json!({"error": {"message": "Quota exceeded"}})));
+    // Upstream errors surface as 502 whose message is the full chain:
+    // request context + HTTP status + Gemini's own message.
+    *fake.reply.lock().unwrap() = Some((429, json!({"error": {"message": "Quota exceeded", "status": "RESOURCE_EXHAUSTED"}})));
+    let (s, v) = call(&app, "POST", "/api/extract", Some(json!({"images": [img], "hint": "ab"}))).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY, "{v}");
+    assert_eq!(v["error"], "upstream");
+    let msg = v["message"].as_str().unwrap();
+    for needle in ["stage 'upstream_status'", "model gemini-test", "1 image [0 KB]", "hint 2 chars", " ms)", "HTTP 429 RESOURCE_EXHAUSTED: Quota exceeded"] {
+        assert!(msg.contains(needle), "missing {needle:?} in {msg:?}");
+    }
+    assert!(!msg.contains("test-key"), "key must never leak: {msg}");
+
+    // Non-JSON error body: raw (truncated) text instead of a parsed message.
+    *fake.reply.lock().unwrap() = Some((500, Value::String("<html>bad gateway</html>".into())));
     let (s, v) = call(&app, "POST", "/api/extract", Some(json!({"images": [img]}))).await;
     assert_eq!(s, StatusCode::BAD_GATEWAY, "{v}");
-    assert!(v["message"].as_str().unwrap().contains("Quota exceeded"));
+    assert!(v["message"].as_str().unwrap().contains("HTTP 500: \"<html>bad gateway</html>\""), "{v}");
 
-    // Garbage answer → 502 too, never 500.
+    // Garbage answer → 502 too, never 500, with the parse stage named.
     *fake.reply.lock().unwrap() = Some((200, json!({"candidates": [{"content": {"parts": [{"text": "lol"}]}}]})));
     let (s, v) = call(&app, "POST", "/api/extract", Some(json!({"images": [img]}))).await;
     assert_eq!(s, StatusCode::BAD_GATEWAY, "{v}");
+    let msg = v["message"].as_str().unwrap();
+    assert!(msg.contains("stage 'parse'") && msg.contains("not valid JSON"), "{msg}");
+
+    // Safety block → 502 with the reason.
+    *fake.reply.lock().unwrap() = Some((200, json!({"promptFeedback": {"blockReason": "SAFETY"}})));
+    let (s, v) = call(&app, "POST", "/api/extract", Some(json!({"images": [img]}))).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY, "{v}");
+    assert!(v["message"].as_str().unwrap().contains("blocked by Gemini (SAFETY)"), "{v}");
 }
 
 #[tokio::test]
-async fn extract_uses_env_key_when_settings_has_none() {
+async fn extract_uses_env_key_and_model() {
     let (base, fake) = start_fake_gemini().await;
-    let app = app_with(Some(base), Some("env-key"));
+    let app = app_custom(GeminiClient::new(Some(base)), Some("env-key"), Some("gemini-2.5-flash-lite"), UNLIMITED, None);
     let img = json!({"mime_type": "image/png", "data": "iVBORw0KGgo="});
     let (s, v) = call(&app, "POST", "/api/extract", Some(json!({"images": [img]}))).await;
     assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["model"], "gemini-2.5-flash-lite");
     let reqs = fake.requests.lock().unwrap();
-    assert!(reqs[0].0.ends_with("|env-key"));
+    assert_eq!(reqs[0].0, "gemini-2.5-flash-lite:generateContent|env-key");
+}
+
+#[tokio::test]
+async fn extract_retries_a_fast_503_once() {
+    let (base, fake) = start_fake_gemini().await;
+    let app = app_with(Some(base), Some("env-key"));
+    let img = json!({"mime_type": "image/png", "data": "iVBORw0KGgo="});
+
+    // 503 then success → 200, two upstream calls.
+    fake.queue.lock().unwrap().push((503, unavailable_body()));
+    let (s, v) = call(&app, "POST", "/api/extract", Some(json!({"images": [img]}))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(fake.requests.lock().unwrap().len(), 2);
+
+    // 503 twice → 502 carrying Gemini's message; exactly one retry.
+    fake.queue.lock().unwrap().extend([(503, unavailable_body()), (503, unavailable_body())]);
+    let (s, v) = call(&app, "POST", "/api/extract", Some(json!({"images": [img]}))).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY, "{v}");
+    let msg = v["message"].as_str().unwrap();
+    assert!(msg.contains("HTTP 503 UNAVAILABLE: This model is currently experiencing high demand"), "{msg}");
+    assert_eq!(fake.requests.lock().unwrap().len(), 4);
+
+    // A 400 is never retried.
+    fake.queue.lock().unwrap().push((400, json!({"error": {"message": "Unable to process input image.", "status": "INVALID_ARGUMENT"}})));
+    let (s, v) = call(&app, "POST", "/api/extract", Some(json!({"images": [img]}))).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY, "{v}");
+    assert!(v["message"].as_str().unwrap().contains("HTTP 400 INVALID_ARGUMENT: Unable to process input image."), "{v}");
+    assert_eq!(fake.requests.lock().unwrap().len(), 5);
+    assert!(fake.queue.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn extract_times_out_with_a_clear_502() {
+    let (base, fake) = start_fake_gemini().await;
+    // 1 s client timeout against a fake that answers after 3 s.
+    let app = app_custom(GeminiClient::with_timeout(Some(base), Duration::from_secs(1)), Some("env-key"), None, UNLIMITED, None);
+    *fake.delay.lock().unwrap() = Duration::from_secs(3);
+    let img = json!({"mime_type": "image/png", "data": "iVBORw0KGgo="});
+    let started = std::time::Instant::now();
+    let (s, v) = call(&app, "POST", "/api/extract", Some(json!({"images": [img]}))).await;
+    let took = started.elapsed();
+    assert_eq!(s, StatusCode::BAD_GATEWAY, "{v}");
+    assert!(took < Duration::from_millis(2500), "timed out at {took:?}, not when the fake answered");
+    let msg = v["message"].as_str().unwrap();
+    assert!(msg.contains("stage 'sending request'"), "{msg}");
+    assert!(msg.contains("no answer from Gemini after"), "{msg}");
+    assert!(msg.contains("timed out"), "the reqwest source must be in the chain: {msg}");
+    assert_eq!(fake.requests.lock().unwrap().len(), 1, "a timeout is not retried");
+    // Settings still count the attempt (it may have cost quota upstream).
+    let (_, st) = call(&app, "GET", "/api/settings", None).await;
+    assert_eq!(st["extractions_today"], 1);
+}
+
+/// A fast 503 followed by a retry that stalls must not take 2 × timeout: the
+/// retry only gets what is left of the budget.
+#[tokio::test]
+async fn retry_after_fast_503_shares_the_timeout_budget() {
+    let (base, fake) = start_fake_gemini().await;
+    let timeout = Duration::from_secs(2);
+    let app = app_custom(GeminiClient::with_timeout(Some(base), timeout), Some("env-key"), None, UNLIMITED, None);
+    fake.queue.lock().unwrap().push((503, unavailable_body())); // instant
+    *fake.delay.lock().unwrap() = Duration::from_secs(5); // the retry stalls
+    let img = json!({"mime_type": "image/png", "data": "iVBORw0KGgo="});
+    let started = std::time::Instant::now();
+    let (s, v) = call(&app, "POST", "/api/extract", Some(json!({"images": [img]}))).await;
+    let took = started.elapsed();
+    assert_eq!(s, StatusCode::BAD_GATEWAY, "{v}");
+    assert_eq!(fake.requests.lock().unwrap().len(), 2, "the 503 was retried once");
+    assert!(took < timeout + Duration::from_millis(700), "whole call must stay within the budget, took {took:?}");
+    let msg = v["message"].as_str().unwrap();
+    assert!(msg.contains("no answer from Gemini after") && msg.contains("timed out"), "{msg}");
 }
 
 // ---------------------------------------------------------------------------
@@ -417,19 +565,85 @@ async fn extract_per_minute_limiter() {
     assert_eq!(s["extract_daily_cap"], 0, "0 = unlimited is reported as-is");
 }
 
+#[test]
+fn gemini_config_from_env_validates_model() {
+    // Env is process-global; this is the only test touching these two vars.
+    std::env::set_var("GEMINI_API_KEY", "  ");
+    std::env::set_var("FISZKI_GEMINI_MODEL", "models/gemini-2.5-flash-lite ");
+    let cfg = GeminiConfig::from_env().unwrap();
+    assert!(cfg.api_key.is_none(), "blank key counts as unset");
+    assert_eq!(cfg.model, "gemini-2.5-flash-lite");
+
+    std::env::set_var("GEMINI_API_KEY", "AIzaX");
+    std::env::set_var("FISZKI_GEMINI_MODEL", "");
+    let cfg = GeminiConfig::from_env().unwrap();
+    assert_eq!(cfg.api_key.as_deref(), Some("AIzaX"));
+    assert_eq!(cfg.model, "gemini-flash-latest", "empty = default");
+
+    std::env::set_var("FISZKI_GEMINI_MODEL", "gemini 2.5 flash");
+    let e = GeminiConfig::from_env().unwrap_err().to_string();
+    assert!(e.contains("FISZKI_GEMINI_MODEL") && e.contains("model name"), "{e}");
+    std::env::remove_var("GEMINI_API_KEY");
+    std::env::remove_var("FISZKI_GEMINI_MODEL");
+}
+
+/// Extractor failures (bad JSON, wrong content-type, body over the limit) are
+/// error paths of `/api/extract` too: they must come back in our JSON error
+/// shape (which is what routes them through `AppError` and its log line), not
+/// as axum's plain-text rejection that only `tower_http` would notice.
 #[tokio::test]
-async fn settings_validate_model_name() {
-    let app = app();
-    let (_, s) = call(&app, "GET", "/api/settings", None).await;
-    assert_eq!(s["gemini_model"], "gemini-flash-latest", "default must be a currently served alias");
-    let (st, v) = call(&app, "PATCH", "/api/settings", Some(json!({"gemini_model": "gemini 2.5 flash"}))).await;
-    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
-    assert!(v["message"].as_str().unwrap().contains("model name"), "{v}");
-    let (st, v) = call(&app, "PATCH", "/api/settings", Some(json!({"gemini_model": "models/gemini-2.5-pro"}))).await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    assert_eq!(v["gemini_model"], "gemini-2.5-pro");
-    let (_, v) = call(&app, "PATCH", "/api/settings", Some(json!({"gemini_model": ""}))).await;
-    assert_eq!(v["gemini_model"], "gemini-flash-latest", "empty resets to default");
+async fn request_rejections_use_the_json_error_shape() {
+    let app = app_with(None, Some("env-key"));
+    let raw = |method: &str, path: &str, ctype: Option<&str>, body: Vec<u8>| {
+        let mut req = Request::builder().method(method).uri(path);
+        if let Some(c) = ctype {
+            req = req.header("content-type", c);
+        }
+        req.body(Body::from(body)).unwrap()
+    };
+    async fn read(resp: axum::response::Response) -> (StatusCode, Value) {
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::String(String::from_utf8_lossy(&bytes).into())))
+    }
+
+    // Malformed JSON.
+    let (s, v) = read(app.clone().oneshot(raw("POST", "/api/extract", Some("application/json"), b"{\"images\": [".to_vec())).await.unwrap()).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["error"], "bad_request", "{v}");
+    let msg = v["message"].as_str().unwrap();
+    assert!(msg.contains("JSON"), "{v}");
+    assert_eq!(msg.matches("EOF while parsing").count(), 1, "serde error must not be repeated: {msg}");
+
+    // Unknown /api path → JSON 404, not the SPA's index.html.
+    let (s, v) = read(app.clone().oneshot(raw("GET", "/api/nope", None, Vec::new())).await.unwrap()).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{v}");
+    assert_eq!(v["error"], "not_found", "{v}");
+    assert!(v["message"].as_str().unwrap().contains("/api/nope"), "{v}");
+
+    // Valid JSON, wrong shape (images is not an array).
+    let (s, v) = read(app.clone().oneshot(raw("POST", "/api/extract", Some("application/json"), b"{\"images\": 5}".to_vec())).await.unwrap()).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["error"], "bad_request", "{v}");
+    assert!(v["message"].as_str().unwrap().contains("images"), "{v}");
+
+    // Missing content-type (what a hand-written curl does).
+    let (s, v) = read(app.clone().oneshot(raw("POST", "/api/extract", None, b"{}".to_vec())).await.unwrap()).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["error"], "bad_request", "{v}");
+    assert!(v["message"].as_str().unwrap().contains("application/json"), "{v}");
+
+    // Body over the limit → 413, still our shape, with the limit named.
+    let big = format!("{{\"images\":[{{\"mime_type\":\"image/jpeg\",\"data\":\"{}\"}}]}}", "A".repeat(fiszki_server::gemini::MAX_REQUEST_BYTES));
+    let (s, v) = read(app.clone().oneshot(raw("POST", "/api/extract", Some("application/json"), big.into_bytes())).await.unwrap()).await;
+    assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+    assert_eq!(v["error"], "bad_request", "{v}");
+    assert!(v["message"].as_str().unwrap().contains("MB"), "{v}");
+
+    // Other handlers use the same extractor.
+    let (s, v) = read(app.clone().oneshot(raw("POST", "/api/units", Some("application/json"), b"nope".to_vec())).await.unwrap()).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["error"], "bad_request", "{v}");
 }
 
 #[tokio::test]

@@ -46,10 +46,19 @@ make build      # npm install + vite build + cargo build --release
 make run        # serves http://localhost:8080  (API + PWA)
 ```
 
-Then open Settings → paste your Gemini API key (from
-<https://aistudio.google.com/apikey>). The key is stored server-side in SQLite
-and never sent to the browser. Alternatively `export GEMINI_API_KEY=...`
-before starting the server (a key saved in Settings takes precedence).
+Photo extraction needs a Gemini API key (from
+<https://aistudio.google.com/apikey>). Put it in `backend/.env` (copy
+`backend/.env.example`) or export it before starting:
+
+```bash
+GEMINI_API_KEY=AIza...            # required for "Cards from photo"
+FISZKI_GEMINI_MODEL=gemini-flash-latest   # optional
+```
+
+The key and model are **server configuration only** – they are not stored in
+the database and cannot be read or changed from the app (Settings shows them
+read-only). That way a leaked app password cannot be used to swap the key or
+point extraction at a more expensive model.
 
 ### Development
 
@@ -69,9 +78,11 @@ make test           # cargo test + vitest
 | `FISZKI_BASIC_AUTH`         | – (off)               | `user:password` → HTTP Basic auth for the whole app            |
 | `FISZKI_EXTRACT_DAILY_CAP`  | `60`                  | max `/api/extract` calls per local day (`0` = unlimited)       |
 | `FISZKI_EXTRACT_PER_MINUTE` | `6`                   | max `/api/extract` calls per minute (`0` = unlimited)          |
-| `GEMINI_API_KEY`            | –                     | fallback key if none is saved in Settings                      |
+| `GEMINI_API_KEY`            | –                     | the Gemini key (required for extraction; env only, never stored) |
+| `FISZKI_GEMINI_MODEL`       | `gemini-flash-latest` | model id (`models/` prefix accepted; validated at startup)     |
+| `FISZKI_GEMINI_TIMEOUT_SECS`| `30`                  | per-attempt Gemini timeout (5–300); one retry on a fast `503`  |
 | `GEMINI_BASE_URL`           | Google's endpoint     | override (tests / proxies)                                     |
-| `RUST_LOG`                  | `info`                | tracing filter                                                 |
+| `RUST_LOG`                  | `info`                | tracing filter (`fiszki_server=debug` logs each Gemini call)   |
 
 ### Using it on the phone
 
@@ -106,11 +117,27 @@ Single-user app, so the protection is deliberately simple:
   without touching Gemini – flip it if a key or device gets lost.
 - **Usage counter** (today / cap · total) is shown in Settings.
 - **Input caps**: ≤ 4 images, ≤ 8 MB base64 each, ≤ 20 MB together, hint
-  ≤ 2000 chars, request body ≤ 21 MB; the model name is validated
-  (`[A-Za-z0-9._-]`, `models/` prefix stripped).
+  ≤ 2000 chars, request body ≤ 21 MB.
+- **Key and model are env-only** (`GEMINI_API_KEY`, `FISZKI_GEMINI_MODEL`):
+  `PATCH /settings` rejects them with `400`, nothing key-related is ever
+  written to SQLite (migration v2 purges rows left by older builds), and the
+  API only reports *whether* a key is set.
+- **Bounded upstream calls**: one extraction is capped at
+  `FISZKI_GEMINI_TIMEOUT_SECS` (30 s) with a 10 s connect timeout; a `503`
+  that comes back within 10 s is retried once after 1.5 s *within the same
+  budget* (so the worst case is ~31.5 s, not 60 s). Anything else is a
+  `502 upstream` whose `message` is the full error chain – stage, model,
+  image count/sizes, latency, upstream HTTP status and Gemini's own message –
+  and the same line is logged at `error` (plus a `warn` from
+  `fiszki_server::gemini` with the first 2 KB of the upstream body) before
+  `tower_http`'s generic `on_failure`. The same goes for every other non-2xx:
+  handler errors log through `AppError`, malformed/oversized request bodies
+  come back as `400`/`413` in the same JSON shape, and anything else (Basic
+  auth `401`, unknown route) is logged by a catch-all middleware.
 
-The Gemini key itself is never returned by the API. Still: keep the port on
-`localhost`, a VPN (Tailscale) or behind an authenticating HTTPS proxy.
+The Gemini key itself is never returned by the API or written to the log. Still:
+keep the port on `localhost`, a VPN (Tailscale) or behind an authenticating
+HTTPS proxy.
 
 ## API (all JSON, under `/api`)
 
@@ -124,7 +151,7 @@ The Gemini key itself is never returned by the API. Still: keep the port on
 | `GET  /study/queue?scope=all\|lesson:ID\|unit:ID&mode=due\|all&ids=` | cards to study    |
 | `POST /study/review {card_id, grade, direction}`  | apply a grade                        |
 | `POST /extract {images:[{mime_type,data}], hint}` | Gemini extraction                    |
-| `GET/PATCH /settings`             | languages, direction, limits, Gemini key (masked)    |
+| `GET/PATCH /settings`             | languages, direction, limits, pause switch; key/model read-only |
 | `GET /export` · `POST /import`    | JSON backup                                          |
 
 ## Scheduling

@@ -451,28 +451,10 @@ pub fn existing_fronts(conn: &Connection) -> Result<HashMap<String, (i64, String
 // ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
-
-/// `gemini-flash-latest` is an alias Google keeps pointing at the current
-/// Flash model, so a fresh install works without knowing today's version.
-pub const DEFAULT_MODEL: &str = "gemini-flash-latest";
-
-/// Accept `gemini-2.5-flash`, `models/gemini-flash-latest`, etc.; reject
-/// anything that cannot be a model id so a typo fails here with a clear
-/// message rather than as a 404 from Gemini.
-pub fn clean_model(m: &str) -> Result<String> {
-    let m = m.trim();
-    let m = m.strip_prefix("models/").unwrap_or(m);
-    if m.is_empty() {
-        return Err(anyhow!("model name must not be empty"));
-    }
-    if m.len() > 80 {
-        return Err(anyhow!("model name is too long (max 80 characters)"));
-    }
-    if !m.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_')) {
-        return Err(anyhow!("model name may only contain letters, digits, '-', '.' and '_' (e.g. {DEFAULT_MODEL})"));
-    }
-    Ok(m.to_string())
-}
+//
+// The Gemini key and model are *not* settings: they come from the server
+// environment only (see `gemini::GeminiConfig`). Migration v2 purges any
+// values an older build stored here.
 
 /// The Stitch design only exists in light; dark is an opt-in derived palette,
 /// so a fresh install must never auto-switch on `prefers-color-scheme`.
@@ -499,17 +481,10 @@ fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn del_setting(conn: &Connection, key: &str) -> Result<()> {
-    conn.execute("DELETE FROM settings WHERE key=?1", [key])?;
-    Ok(())
-}
 
-pub fn get_api_key(conn: &Connection) -> Result<Option<String>> {
-    get_setting(conn, "gemini_api_key")
-}
-
+/// Persisted settings. `gemini_model` / `gemini_api_key_set` are placeholders
+/// here – the route fills them from the server environment.
 pub fn get_settings(conn: &Connection) -> Result<Settings> {
-    let key = get_api_key(conn)?.filter(|k| !k.is_empty());
     let usage = extraction_usage(conn, now())?;
     Ok(Settings {
         front_lang: get_setting(conn, "front_lang")?.unwrap_or_else(|| "Español".into()),
@@ -517,12 +492,8 @@ pub fn get_settings(conn: &Connection) -> Result<Settings> {
         study_direction: get_setting(conn, "study_direction")?.unwrap_or_else(|| "front_to_back".into()),
         new_per_day: get_setting(conn, "new_per_day")?.and_then(|v| v.parse().ok()).unwrap_or(15),
         haptics: get_setting(conn, "haptics")?.map(|v| v == "true").unwrap_or(true),
-        gemini_model: get_setting(conn, "gemini_model")?.filter(|m| !m.is_empty()).unwrap_or_else(|| DEFAULT_MODEL.into()),
-        gemini_api_key_set: key.is_some(),
-        gemini_api_key_hint: key.map(|k| {
-            let tail: String = k.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
-            format!("…{tail}")
-        }),
+        gemini_model: String::new(),
+        gemini_api_key_set: false,
         last_lesson_id: get_setting(conn, "last_lesson_id")?.and_then(|v| v.parse().ok()),
         extraction_paused: extraction_paused(conn)?,
         extractions_today: usage.today,
@@ -532,7 +503,14 @@ pub fn get_settings(conn: &Connection) -> Result<Settings> {
     })
 }
 
+pub const SERVER_ONLY_SETTING_MSG: &str =
+    "the Gemini API key and model are configured on the server (GEMINI_API_KEY / FISZKI_GEMINI_MODEL) and cannot be changed from the app";
+
 pub fn patch_settings(conn: &Connection, p: &SettingsPatch) -> Result<Settings> {
+    // Rejected first, so a request that tries it changes nothing at all.
+    if p.gemini_api_key.is_some() || p.gemini_model.is_some() {
+        return Err(anyhow!(SERVER_ONLY_SETTING_MSG));
+    }
     if let Some(v) = &p.front_lang {
         set_setting(conn, "front_lang", &clean_name(v)?)?;
     }
@@ -553,22 +531,6 @@ pub fn patch_settings(conn: &Connection, p: &SettingsPatch) -> Result<Settings> 
     }
     if let Some(v) = p.haptics {
         set_setting(conn, "haptics", if v { "true" } else { "false" })?;
-    }
-    if let Some(v) = &p.gemini_model {
-        if v.trim().is_empty() {
-            // Empty = back to the default.
-            del_setting(conn, "gemini_model")?;
-        } else {
-            set_setting(conn, "gemini_model", &clean_model(v)?)?;
-        }
-    }
-    if let Some(v) = &p.gemini_api_key {
-        let k = v.trim();
-        if k.is_empty() {
-            del_setting(conn, "gemini_api_key")?;
-        } else {
-            set_setting(conn, "gemini_api_key", k)?;
-        }
     }
     if let Some(v) = p.last_lesson_id {
         set_setting(conn, "last_lesson_id", &v.to_string())?;
@@ -1073,43 +1035,54 @@ mod tests {
     }
 
     #[test]
-    fn settings_roundtrip_and_key_masking() {
+    fn settings_roundtrip() {
         let c = conn();
         let s = get_settings(&c).unwrap();
         assert_eq!(s.front_lang, "Español");
         assert_eq!(s.new_per_day, 15);
-        assert!(!s.gemini_api_key_set);
         let s = patch_settings(
             &c,
-            &SettingsPatch { front_lang: Some("Polski".into()), back_lang: Some("English".into()), gemini_api_key: Some("AIzaSyEXAMPLE1234".into()), study_direction: Some("mixed".into()), ..Default::default() },
+            &SettingsPatch { front_lang: Some("Polski".into()), back_lang: Some("English".into()), study_direction: Some("mixed".into()), ..Default::default() },
         )
         .unwrap();
         assert_eq!(s.front_lang, "Polski");
         assert_eq!(s.back_lang, "English");
-        assert!(s.gemini_api_key_set);
-        assert_eq!(s.gemini_api_key_hint.as_deref(), Some("…1234"));
         assert_eq!(s.study_direction, "mixed");
-        assert_eq!(get_api_key(&c).unwrap().as_deref(), Some("AIzaSyEXAMPLE1234"));
-        let s = patch_settings(&c, &SettingsPatch { gemini_api_key: Some("".into()), ..Default::default() }).unwrap();
-        assert!(!s.gemini_api_key_set);
         assert!(patch_settings(&c, &SettingsPatch { study_direction: Some("sideways".into()), ..Default::default() }).is_err());
         assert!(patch_settings(&c, &SettingsPatch { new_per_day: Some(-1), ..Default::default() }).is_err());
     }
 
     #[test]
-    fn model_name_is_validated_and_defaults() {
+    fn key_and_model_are_not_settings() {
         let c = conn();
-        assert_eq!(get_settings(&c).unwrap().gemini_model, DEFAULT_MODEL);
-        let s = patch_settings(&c, &SettingsPatch { gemini_model: Some(" models/gemini-2.5-flash ".into()), ..Default::default() }).unwrap();
-        assert_eq!(s.gemini_model, "gemini-2.5-flash", "prefix stripped, trimmed");
-        let e = patch_settings(&c, &SettingsPatch { gemini_model: Some("gemini flash; drop".into()), ..Default::default() }).unwrap_err().to_string();
-        assert!(e.contains(DEFAULT_MODEL), "{e}");
-        assert!(patch_settings(&c, &SettingsPatch { gemini_model: Some("x".repeat(81)), ..Default::default() }).is_err());
-        assert_eq!(get_settings(&c).unwrap().gemini_model, "gemini-2.5-flash", "rejected value did not overwrite");
-        let s = patch_settings(&c, &SettingsPatch { gemini_model: Some("".into()), ..Default::default() }).unwrap();
-        assert_eq!(s.gemini_model, DEFAULT_MODEL, "empty resets to default");
-        assert!(clean_model("models/").is_err());
-        assert_eq!(clean_model("gemini-2.0-flash_exp.v1").unwrap(), "gemini-2.0-flash_exp.v1");
+        // Rejected with a clear message, and the other fields in the same patch are not applied either.
+        for p in [
+            SettingsPatch { gemini_api_key: Some("AIzaSyEXAMPLE1234".into()), front_lang: Some("Deutsch".into()), ..Default::default() },
+            SettingsPatch { gemini_api_key: Some(String::new()), ..Default::default() },
+            SettingsPatch { gemini_model: Some("gemini-2.5-pro".into()), ..Default::default() },
+            SettingsPatch { gemini_model: Some(String::new()), ..Default::default() },
+        ] {
+            let e = patch_settings(&c, &p).unwrap_err().to_string();
+            assert_eq!(e, SERVER_ONLY_SETTING_MSG);
+        }
+        assert_eq!(get_settings(&c).unwrap().front_lang, "Español", "rejected patch changed nothing");
+        let n: i64 = c.query_row("SELECT count(*) FROM settings WHERE key IN ('gemini_api_key','gemini_model')", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0, "nothing key/model-related is ever written");
+    }
+
+    #[test]
+    fn migration_v2_purges_key_and_model_rows() {
+        // Simulate a v1 database that still holds the key, then migrate.
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(crate::db::MIGRATIONS[0]).unwrap();
+        c.execute_batch("PRAGMA user_version = 1;").unwrap();
+        set_setting(&c, "gemini_api_key", "AIzaOld").unwrap();
+        set_setting(&c, "gemini_model", "gemini-old").unwrap();
+        set_setting(&c, "theme", "dark").unwrap();
+        crate::db::migrate(&c).unwrap();
+        let n: i64 = c.query_row("SELECT count(*) FROM settings WHERE key IN ('gemini_api_key','gemini_model')", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(get_settings(&c).unwrap().theme, "dark", "other settings survive");
     }
 
     #[test]

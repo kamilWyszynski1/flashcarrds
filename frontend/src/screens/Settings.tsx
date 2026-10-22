@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Icon } from '../components/Icon';
-import { Button, Label, Toggle, TopBar, fieldClass } from '../components/ui';
+import { Button, Label, Toggle, TopBar } from '../components/ui';
 import { api } from '../lib/api';
 import { useStore } from '../lib/store';
 import type { Theme } from '../lib/theme';
@@ -21,9 +21,6 @@ if (typeof window !== 'undefined') {
 
 export function Settings() {
   const { settings, setSettings, overview, toast, refresh } = useStore();
-  const [key, setKey] = useState('');
-  const [model, setModel] = useState('');
-  const [saving, setSaving] = useState(false);
   const [canInstall, setCanInstall] = useState(!!deferredInstall);
   const importRef = useRef<HTMLInputElement>(null);
   const installed = typeof window !== 'undefined' && (window.matchMedia('(display-mode: standalone)').matches || (navigator as { standalone?: boolean }).standalone === true);
@@ -38,12 +35,7 @@ export function Settings() {
     return () => window.removeEventListener('beforeinstallprompt', h);
   }, []);
 
-  useEffect(() => {
-    if (settings) setModel(settings.gemini_model);
-  }, [settings]);
-
   const patch = async (p: SettingsPatch, msg?: string) => {
-    setSaving(true);
     try {
       const s = await api.patchSettings(p);
       setSettings(s);
@@ -51,25 +43,7 @@ export function Settings() {
       return s;
     } catch (e) {
       toast((e as Error).message);
-    } finally {
-      setSaving(false);
     }
-  };
-
-  const saveKey = async () => {
-    const k = key.trim();
-    if (!k) return;
-    const s = await patch({ gemini_api_key: k }, 'API key saved');
-    if (s) setKey('');
-  };
-
-  const commitModel = async () => {
-    if (!settings) return;
-    const m = model.trim();
-    if (m === settings.gemini_model) return;
-    // Blank = reset to the server default; the server validates the name and returns the effective one.
-    const s = await patch({ gemini_model: m }, m ? `Model set to ${m}` : 'Model reset to default');
-    setModel(s ? s.gemini_model : settings.gemini_model);
   };
 
   const exportBackup = async () => {
@@ -174,46 +148,13 @@ export function Settings() {
 
         <Label>Gemini (photo extraction)</Label>
         <Section>
-          <div className="py-3">
-            <div className="flex items-center justify-between gap-3">
-              <div>
-                <div className="text-body-md font-semibold text-on-surface">API key</div>
-                <div className="text-body-sm text-on-surface-variant">
-                  {settings.gemini_api_key_set ? `Configured (${settings.gemini_api_key_hint})` : 'Not set – required for “Cards from photo”'}
-                </div>
-              </div>
-              {settings.gemini_api_key_set && (
-                <Button variant="outline" size="sm" onClick={() => void patch({ gemini_api_key: '' }, 'API key removed')}>
-                  Remove
-                </Button>
-              )}
-            </div>
-            <div className="flex gap-2 mt-3">
-              <input className={`${fieldClass} min-h-[44px] py-2`} type="password" value={key} onChange={(e) => setKey(e.target.value)} placeholder={settings.gemini_api_key_set ? 'Paste a new key to replace' : 'AIza…'} autoComplete="off" />
-              <Button size="sm" className="h-[44px] shrink-0" disabled={!key.trim() || saving} onClick={() => void saveKey()}>
-                Save
-              </Button>
-            </div>
-            <p className="text-body-sm text-on-surface-variant mt-2">
-              Get a key at{' '}
-              <a className="text-primary underline" href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer">
-                aistudio.google.com/apikey
-              </a>
-              . It is stored on your server only and never sent to the browser.
-            </p>
-          </div>
-          <Row title="Model" text="Blank = default (gemini-flash-latest)">
-            <input
-              className="bg-surface-container rounded-full px-3 h-10 text-label-lg text-on-surface outline-none w-[170px]"
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-              onBlur={() => void commitModel()}
-              onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
-              placeholder="gemini-flash-latest"
-              autoCapitalize="none"
-              autoCorrect="off"
-              spellCheck={false}
-            />
+          <Row title="API key" text={settings.gemini_api_key_set ? 'Configured via GEMINI_API_KEY on the server' : 'Not set – add GEMINI_API_KEY to the server’s .env and restart'}>
+            <span className={`px-2.5 py-1 rounded-full text-label-sm font-bold ${settings.gemini_api_key_set ? 'bg-tertiary-fixed text-on-tertiary-fixed' : 'bg-error-container text-on-error-container'}`}>
+              {settings.gemini_api_key_set ? 'configured' : 'missing'}
+            </span>
+          </Row>
+          <Row title="Model" text="Set with FISZKI_GEMINI_MODEL on the server">
+            <code className="text-label-lg text-on-surface whitespace-nowrap">{settings.gemini_model}</code>
           </Row>
           <Row title="Pause extraction" text={settings.extraction_paused ? 'Photo requests are rejected' : 'Kill switch for the Gemini key'}>
             <Toggle on={settings.extraction_paused} onChange={(v) => void patch({ extraction_paused: v }, v ? 'Extraction paused' : 'Extraction resumed')} label="Pause extraction" />
@@ -226,8 +167,8 @@ export function Settings() {
           </Row>
         </Section>
         <p className="text-body-sm text-on-surface-variant mt-2 px-1">
-          The daily cap and per-minute limit are set on the server (<code>FISZKI_EXTRACT_DAILY_CAP</code>, <code>FISZKI_EXTRACT_PER_MINUTE</code>); protect the whole app with{' '}
-          <code>FISZKI_BASIC_AUTH=user:password</code> before exposing it.
+          The key and model are read-only here on purpose: nothing that can be done from the app (or with a stolen password) can change or reveal them. The daily cap and per-minute limit are also server settings (<code>FISZKI_EXTRACT_DAILY_CAP</code>,{' '}
+          <code>FISZKI_EXTRACT_PER_MINUTE</code>); protect the whole app with <code>FISZKI_BASIC_AUTH=user:password</code> before exposing it.
         </p>
 
         <Label>Data</Label>

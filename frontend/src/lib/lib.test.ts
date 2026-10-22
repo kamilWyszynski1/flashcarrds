@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import { ApiError } from './api';
+import { describeExtractError } from './extractError';
 import { applyGrade, createSession, current, isFinished, progress, summarize, REQUEUE_GAP } from './session';
 import { parsePairs } from './paste';
 import { fmtInterval, lessonMeta } from './format';
@@ -182,5 +184,25 @@ describe('theme', () => {
       g.window = saved.window;
       g.localStorage = saved.localStorage;
     }
+  });
+});
+
+describe('describeExtractError', () => {
+  const upstream = (msg: string) => new ApiError(502, 'upstream', msg);
+  it('shows the server chain verbatim and adds a retry hint only for transient upstream failures', () => {
+    const busy = "Gemini extraction failed at stage 'upstream_status' (model gemini-flash-latest, 1 image [312 KB], hint 0 chars, 2210 ms): Gemini answered HTTP 503 UNAVAILABLE: This model is currently experiencing high demand.";
+    expect(describeExtractError(upstream(busy))).toBe(`${busy} — Gemini is busy or unreachable; try again in a minute.`);
+    const timeout = "Gemini extraction failed at stage 'sending request' (model gemini-flash-latest, 1 image [312 KB], hint 0 chars, 30001 ms): no answer from Gemini after 30001 ms: error sending request: operation timed out";
+    expect(describeExtractError(upstream(timeout))).toContain('try again in a minute');
+    const bad = "Gemini extraction failed at stage 'upstream_status' (model gemini-flash-latest, 1 image [3 KB], hint 0 chars, 164 ms): Gemini answered HTTP 400 INVALID_ARGUMENT: Unable to process input image.";
+    expect(describeExtractError(upstream(bad))).toBe(bad);
+    const parse = "Gemini extraction failed at stage 'parse' (…): could not understand Gemini's answer: answer was not valid JSON";
+    expect(describeExtractError(upstream(parse))).toBe(parse);
+  });
+  it('passes through non-upstream API errors and plain errors', () => {
+    expect(describeExtractError(new ApiError(409, 'paused', 'Extraction is paused – switch it back on in Settings'))).toBe('Extraction is paused – switch it back on in Settings');
+    expect(describeExtractError(new ApiError(400, 'bad_request', 'Gemini API key is not configured – set GEMINI_API_KEY on the server'))).toContain('GEMINI_API_KEY');
+    expect(describeExtractError(new Error('boom'))).toBe('boom');
+    expect(describeExtractError(undefined)).toBe('Extraction failed.');
   });
 });
