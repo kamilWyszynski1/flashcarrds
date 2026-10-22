@@ -32,6 +32,21 @@ export function createSession(items: StudyItem[], startedAt = Date.now()): Sessi
   return { queue: items, total: items.length, done: 0, results: [], startedAt };
 }
 
+/**
+ * Returns a new array with `items` in random order (Fisher–Yates). The input
+ * is not mutated. The server already randomises its queue; the client shuffles
+ * again so explicit-id sessions ("repeat the missed ones") are mixed too and
+ * a cached/replayed response never yields the same order twice.
+ */
+export function shuffle<T>(items: readonly T[], rng: () => number = Math.random): T[] {
+  const out = items.slice();
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
+}
+
 export function current(s: SessionState): StudyItem | undefined {
   return s.queue[0];
 }

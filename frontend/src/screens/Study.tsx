@@ -4,7 +4,7 @@ import { Icon } from '../components/Icon';
 import { Button, Empty, ErrorBox, IconButton, Spinner } from '../components/ui';
 import { api } from '../lib/api';
 import { vibrate } from '../lib/format';
-import { applyGrade, createSession, current, isFinished, progress, summarize, type SessionState } from '../lib/session';
+import { applyGrade, createSession, current, isFinished, progress, shuffle, summarize, type SessionState } from '../lib/session';
 import { useSheets } from '../lib/sheets';
 import { useStore } from '../lib/store';
 import { setEditingCard } from '../sheets/Sheets';
@@ -55,7 +55,8 @@ export function Study() {
     setSession(null);
     try {
       const items = await api.studyQueue({ scope: scope || undefined, mode, ids, limit: 200 });
-      setSession(createSession(items));
+      // Random order per session (also for explicit-id "repeat" sessions) so it is harder to anticipate.
+      setSession(createSession(shuffle(items)));
       setFlipped(false);
       finishedRef.current = false;
     } catch (e) {

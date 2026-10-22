@@ -640,6 +640,11 @@ pub fn study_queue(conn: &Connection, req: &QueueRequest) -> Result<Vec<StudyIte
         if mode == "all" {
             cards.extend(later);
         }
+        // Truncate first (so `limit` still prefers due cards over new ones),
+        // then randomise the order so every session feels different.
+        // Explicit `ids` keep the caller's order; the client shuffles those.
+        cards.truncate(limit);
+        shuffle(&mut cards, &mut SessionRng::new());
     }
     cards.truncate(limit);
 
@@ -678,6 +683,59 @@ fn parse_scope_id(s: &str) -> Result<i64> {
     s.split_once(':')
         .and_then(|(_, id)| id.parse().ok())
         .ok_or_else(|| anyhow!("bad scope '{s}'"))
+}
+
+/// Small, dependency-free PRNG (splitmix64) for shuffling study queues.
+/// Not cryptographic; it only has to make sessions feel different.
+pub struct SessionRng(u64);
+
+impl SessionRng {
+    /// Seeded from std's per-process random hasher state mixed with the
+    /// clock, so two queues requested back to back still differ.
+    pub fn new() -> Self {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+        Self::seeded(h.finish())
+    }
+
+    pub fn seeded(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    pub fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Uniform in `0..n` (n > 0). Rejection sampling avoids modulo bias.
+    fn below(&mut self, n: usize) -> usize {
+        let n = n as u64;
+        let zone = u64::MAX - (u64::MAX % n);
+        loop {
+            let v = self.next_u64();
+            if v < zone {
+                return (v % n) as usize;
+            }
+        }
+    }
+}
+
+impl Default for SessionRng {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// In-place Fisher–Yates shuffle.
+pub fn shuffle<T>(items: &mut [T], rng: &mut SessionRng) {
+    for i in (1..items.len()).rev() {
+        let j = rng.below(i + 1);
+        items.swap(i, j);
+    }
 }
 
 fn card_srs(c: &Card) -> SrsState {
@@ -1015,12 +1073,12 @@ mod tests {
         let q = study_queue(&c, &QueueRequest { scope: Some(format!("unit:{}", u.id)), mode: Some("all".into()), ..Default::default() }).unwrap();
         assert_eq!(q.len(), 8, "mode=all ignores the budget");
 
-        // Make one card due in the past: it must come first.
+        // Make one card due in the past: it is always part of the queue (position is random).
         let target = q[7].card.id;
         c.execute("UPDATE cards SET state=2, due=0, interval_days=3 WHERE id=?1", [target]).unwrap();
         let q = study_queue(&c, &QueueRequest::default()).unwrap();
-        assert_eq!(q[0].card.id, target);
-        assert_eq!(q[0].card.status, "due");
+        let due_item = q.iter().find(|i| i.card.id == target).expect("due card is in the queue");
+        assert_eq!(due_item.card.status, "due");
         assert_eq!(q.len(), 6, "1 due + 5 new");
 
         // Explicit ids keep the given order.
@@ -1032,6 +1090,108 @@ mod tests {
         let q3 = study_queue(&c, &QueueRequest { direction: Some("back_to_front".into()), ..Default::default() }).unwrap();
         assert!(q3.iter().all(|i| i.direction == "reverse"));
         assert!(study_queue(&c, &QueueRequest { scope: Some("galaxy:1".into()), ..Default::default() }).is_err());
+    }
+
+    #[test]
+    fn shuffle_is_a_permutation_and_seed_deterministic() {
+        // Empty and single-element slices are fine.
+        let mut empty: Vec<i32> = vec![];
+        shuffle(&mut empty, &mut SessionRng::seeded(1));
+        assert!(empty.is_empty());
+        let mut one = vec![42];
+        shuffle(&mut one, &mut SessionRng::seeded(1));
+        assert_eq!(one, vec![42]);
+
+        let base: Vec<u32> = (0..50).collect();
+        let mut a = base.clone();
+        shuffle(&mut a, &mut SessionRng::seeded(7));
+        let mut sorted = a.clone();
+        sorted.sort();
+        assert_eq!(sorted, base, "shuffle keeps every element exactly once");
+        assert_ne!(a, base, "50 elements practically never come back in identity order");
+
+        let mut b = base.clone();
+        shuffle(&mut b, &mut SessionRng::seeded(7));
+        assert_eq!(a, b, "same seed, same order");
+        let mut c = base.clone();
+        shuffle(&mut c, &mut SessionRng::seeded(8));
+        assert_ne!(a, c, "different seed, different order");
+
+        // `below` stays in range and hits every bucket for a small n.
+        let mut rng = SessionRng::seeded(3);
+        let mut seen = [false; 5];
+        for _ in 0..500 {
+            let v = rng.below(5);
+            assert!(v < 5);
+            seen[v] = true;
+        }
+        assert!(seen.iter().all(|&s| s), "every bucket reachable");
+
+        // Fresh seeds differ between consecutive sessions.
+        let (x, y) = (SessionRng::new().next_u64(), SessionRng::new().next_u64());
+        assert_ne!(x, y);
+    }
+
+    #[test]
+    fn study_queue_order_varies_between_sessions() {
+        let c = conn();
+        let (_u, l1, _) = seed(&c);
+        // 12 cards; mark 4 of them due so the queue mixes due + new.
+        let ids = create_cards(&c, l1.id, &(0..12).map(|i| NewCard { front: format!("w{i}"), back: "x".into(), example: None }).collect::<Vec<_>>()).unwrap();
+        for id in &ids[..4] {
+            c.execute("UPDATE cards SET state=2, due=0, interval_days=3 WHERE id=?1", [id]).unwrap();
+        }
+        patch_settings(&c, &SettingsPatch { new_per_day: Some(8), ..Default::default() }).unwrap();
+
+        let order = |req: &QueueRequest| study_queue(&c, req).unwrap().iter().map(|i| i.card.id).collect::<Vec<_>>();
+        let mut expected: Vec<i64> = ids.clone();
+        expected.sort();
+
+        let first = order(&QueueRequest::default());
+        assert_eq!(first.len(), 12, "4 due + 8 new (budget)");
+        let mut got = first.clone();
+        got.sort();
+        assert_eq!(got, expected, "shuffling never drops or duplicates a card");
+
+        // Probability that 6 fresh draws all reproduce `first` is ~(1/12!)^6.
+        let differs = (0..6).any(|_| order(&QueueRequest::default()) != first);
+        assert!(differs, "the same cards should come in a different order in another session");
+
+        // Limit still prefers due cards: with limit=4 only the due ones are served, in some order.
+        let mut limited = order(&QueueRequest { limit: Some(4), ..Default::default() });
+        limited.sort();
+        let mut due_ids: Vec<i64> = ids[..4].to_vec();
+        due_ids.sort();
+        assert_eq!(limited, due_ids);
+
+        // New-card budget: 8 of 8 new cards fit, but with a budget of 3 only the 3 oldest new cards are served.
+        patch_settings(&c, &SettingsPatch { new_per_day: Some(3), ..Default::default() }).unwrap();
+        let mut q = order(&QueueRequest::default());
+        q.sort();
+        let mut want: Vec<i64> = ids[..7].to_vec(); // 4 due + 3 oldest new (ids are monotonic)
+        want.sort();
+        assert_eq!(q, want, "budget still picks the oldest new cards, only the order is random");
+
+        // Explicit ids are untouched by the server shuffle.
+        let explicit = format!("{},{},{}", ids[5], ids[1], ids[9]);
+        assert_eq!(order(&QueueRequest { ids: Some(explicit), ..Default::default() }), vec![ids[5], ids[1], ids[9]]);
+
+        // mode=all: the served *set* is still carved as due → new → not-yet-due before the shuffle,
+        // so a limit never drops a due card in favour of one scheduled far in the future.
+        let later = ids[11];
+        c.execute("UPDATE cards SET state=2, due=?1, interval_days=30 WHERE id=?2", [now() + 30 * 86_400, later]).unwrap();
+        let all_req = |limit: Option<i64>| QueueRequest { mode: Some("all".into()), limit, ..Default::default() };
+        let mut everything = order(&all_req(None));
+        everything.sort();
+        assert_eq!(everything, expected, "mode=all ignores the budget and includes the not-yet-due card");
+        let capped = order(&all_req(Some(11)));
+        assert_eq!(capped.len(), 11);
+        assert!(!capped.contains(&later), "the not-yet-due card is the first to be cut by the limit");
+        let mut capped = order(&all_req(Some(6)));
+        capped.sort();
+        let mut want: Vec<i64> = ids[..6].to_vec(); // 4 due + 2 oldest new
+        want.sort();
+        assert_eq!(capped, want, "limit under mode=all still prefers due, then oldest new");
     }
 
     #[test]

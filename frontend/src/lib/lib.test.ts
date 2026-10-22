@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { ApiError } from './api';
 import { describeExtractError } from './extractError';
-import { applyGrade, createSession, current, isFinished, progress, summarize, REQUEUE_GAP } from './session';
+import { applyGrade, createSession, current, isFinished, progress, shuffle, summarize, REQUEUE_GAP } from './session';
 import { parsePairs } from './paste';
 import { fmtInterval, lessonMeta } from './format';
 import { DEFAULT_THEME, THEMES, THEME_COLOR, THEME_KEY, applyTheme, isTheme, resolveTheme } from './theme';
@@ -101,6 +101,62 @@ describe('session queue', () => {
     expect(sum.accuracy).toBe(67);
     expect(sum.missed).toEqual([{ cardId: 1, front: 'f1', back: 'b1' }]);
     expect(sum.durationMs).toBe(60000);
+  });
+
+  describe('shuffle', () => {
+    const ids = (xs: StudyItem[]) => xs.map((i) => i.card.id);
+    const deck = (n: number) => Array.from({ length: n }, (_, k) => item(k + 1));
+
+    it('keeps every card exactly once and does not mutate the input', () => {
+      const input = deck(20);
+      const before = ids(input);
+      const out = shuffle(input);
+      expect(ids(input)).toEqual(before);
+      expect(out).not.toBe(input);
+      expect([...ids(out)].sort((a, b) => a - b)).toEqual(before);
+    });
+
+    it('handles empty and single-card queues', () => {
+      expect(shuffle([])).toEqual([]);
+      expect(ids(shuffle([item(9)]))).toEqual([9]);
+    });
+
+    it('is deterministic for a given rng and different for different rngs', () => {
+      const lcg = (seed: number) => () => {
+        seed = (seed * 1664525 + 1013904223) % 4294967296;
+        return seed / 4294967296;
+      };
+      const a = ids(shuffle(deck(12), lcg(1)));
+      const b = ids(shuffle(deck(12), lcg(1)));
+      const c = ids(shuffle(deck(12), lcg(2)));
+      expect(a).toEqual(b);
+      expect(a).not.toEqual(c);
+      // rng returning 0 always swaps with index 0 → a specific, in-range permutation (no NaN/undefined holes).
+      expect(ids(shuffle(deck(4), () => 0))).toEqual([2, 3, 4, 1]);
+      // rng just below 1 picks j = i → identity (never out of bounds).
+      expect(ids(shuffle(deck(4), () => 0.999999))).toEqual([1, 2, 3, 4]);
+    });
+
+    it('two sessions over the same cards come in a different order', () => {
+      const cards = deck(10);
+      const first = ids(shuffle(cards));
+      // P(6 independent draws all equal `first`) ≈ (1/10!)^5 — not a flake source.
+      const differs = Array.from({ length: 6 }, () => ids(shuffle(cards))).some((o) => o.join() !== first.join());
+      expect(differs).toBe(true);
+      // And it is still a permutation of the same cards.
+      expect([...first].sort((a, b) => a - b)).toEqual(ids(cards));
+    });
+
+    it('an Again card on a shuffled queue still returns later, not immediately next', () => {
+      let s = createSession(shuffle(deck(8)), 0);
+      const firstId = current(s)!.card.id;
+      const rest = s.queue.slice(1).map((i) => i.card.id);
+      s = applyGrade(s, 'again', 60);
+      expect(current(s)?.card.id).not.toBe(firstId);
+      expect(s.queue.map((i) => i.card.id)).toEqual([...rest.slice(0, REQUEUE_GAP), firstId, ...rest.slice(REQUEUE_GAP)]);
+      expect(s.total).toBe(8);
+      expect(s.done).toBe(0);
+    });
   });
 });
 
