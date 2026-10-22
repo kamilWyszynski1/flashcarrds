@@ -2,6 +2,12 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import { App } from './App';
 import './index.css';
+import { isLocalBackend } from './lib/api';
+import { requestPersistentStorage } from './lib/db';
+
+if (isLocalBackend) {
+  void requestPersistentStorage();
+}
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>

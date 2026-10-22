@@ -2,6 +2,13 @@ import { ApiError } from './api.errors';
 import type { FiszkiApi } from './api';
 import { db, DEFAULT_SETTINGS, type DbCard, type DbLesson, type DbUnit } from './db';
 import {
+  RateLimiter,
+  cleanModel,
+  extractFromGemini,
+  validateImages,
+  MAX_HINT_CHARS,
+} from './gemini';
+import {
   fmtDays,
   fmtIntervalSecs,
   INITIAL_EASE,
@@ -21,6 +28,7 @@ import {
 import type {
   Card,
   Counts,
+  ExtractedCard,
   ExtractResponse,
   Lesson,
   LessonDetail,
@@ -42,6 +50,37 @@ export function startOfLocalDay(nowEpochSecs: number): number {
   const d = new Date(nowEpochSecs * 1000);
   d.setHours(0, 0, 0, 0);
   return Math.floor(d.getTime() / 1000);
+}
+
+export const rateLimiter = new RateLimiter(6);
+
+export function resetRateLimiter(): void {
+  rateLimiter.reset();
+}
+
+export function normalizeFront(s: string): string {
+  return s.trim().toLowerCase().split(/\s+/).filter(Boolean).join(' ');
+}
+
+export async function recordExtraction(now: number): Promise<{ today: number; total: number }> {
+  const d = new Date(now * 1000);
+  const dayStr = d.toISOString().slice(0, 10);
+  const row = await db.usage.get(dayStr);
+  const count = (row?.count ?? 0) + 1;
+  await db.usage.put({ day: dayStr, count });
+
+  const allUsages = await db.usage.toArray();
+  const total = allUsages.reduce((sum, u) => sum + u.count, 0);
+  return { today: count, total };
+}
+
+export async function getExtractionUsage(now: number): Promise<{ today: number; total: number }> {
+  const d = new Date(now * 1000);
+  const dayStr = d.toISOString().slice(0, 10);
+  const row = await db.usage.get(dayStr);
+  const allUsages = await db.usage.toArray();
+  const total = allUsages.reduce((sum, u) => sum + u.count, 0);
+  return { today: row?.count ?? 0, total };
 }
 
 function cleanUnitName(name: string): string {
@@ -754,18 +793,112 @@ export const localApi: FiszkiApi = {
     };
   },
 
-  async extract(_images: { mime_type: string; data: string }[], hint: string, _signal?: AbortSignal): Promise<ExtractResponse> {
-    // Stage 3 will implement full client-side Gemini extraction
+  async extract(images: { mime_type: string; data: string }[], hint: string, signal?: AbortSignal): Promise<ExtractResponse> {
+    try {
+      validateImages(images);
+    } catch (e: any) {
+      throw new ApiError(400, 'validation', e.message);
+    }
+    const truncatedHint = (hint ?? '').slice(0, MAX_HINT_CHARS);
+
+    const settingsRows = await db.settings.toArray();
+    const map = new Map(settingsRows.map((s) => [s.key, s.value]));
+
+    const extractionPaused = map.get('extraction_paused') === 'true' || map.get('gemini_paused') === '1';
+    if (extractionPaused) {
+      throw new ApiError(403, 'paused', 'Extraction is paused – switch it back on in Settings');
+    }
+
+    const apiKey = (map.get('gemini_api_key') ?? '').trim();
+    if (!apiKey) {
+      throw new ApiError(400, 'no_api_key', 'Gemini API key is not configured – add your key in Settings');
+    }
+
+    const rawModel = map.get('gemini_model') ?? DEFAULT_SETTINGS.gemini_model;
+    let model: string;
+    try {
+      model = cleanModel(rawModel);
+    } catch (e: any) {
+      throw new ApiError(400, 'validation', e.message);
+    }
+
+    const capStr = map.get('extract_daily_cap') ?? map.get('gemini_daily_limit') ?? DEFAULT_SETTINGS.gemini_daily_limit;
+    const cap = parseInt(capStr, 10) || 0;
+    const now = nowTs();
+    const currentUsage = await getExtractionUsage(now);
+    if (cap > 0 && currentUsage.today >= cap) {
+      throw new ApiError(429, 'rate_limit', `Daily extraction limit reached (${cap}/day) – try again tomorrow`);
+    }
+
+    const rpmStr = map.get('gemini_rpm_limit') ?? DEFAULT_SETTINGS.gemini_rpm_limit;
+    const rpm = parseInt(rpmStr, 10) || 6;
+    rateLimiter.setMax(rpm);
+    const limiterCheck = rateLimiter.check();
+    if (!limiterCheck.ok) {
+      throw new ApiError(429, 'rate_limit', `Too many extractions in a row – wait ${limiterCheck.waitSecs}s and try again`);
+    }
+
+    await recordExtraction(now);
+
+    const frontLang = map.get('front_lang') ?? DEFAULT_SETTINGS.front_lang;
+    const backLang = map.get('back_lang') ?? DEFAULT_SETTINGS.back_lang;
+
+    let extractedCards: ExtractedCard[];
+    try {
+      extractedCards = await extractFromGemini({
+        apiKey,
+        model,
+        images,
+        hint: truncatedHint,
+        frontLang,
+        backLang,
+        signal,
+      });
+    } catch (e: any) {
+      if (e?.name === 'AbortError' || signal?.aborted) {
+        throw e;
+      }
+      throw new ApiError(502, 'upstream', e.message);
+    }
+
+    const [allDbCards, allLessons] = await Promise.all([db.cards.toArray(), db.lessons.toArray()]);
+    const lessonMap = new Map(allLessons.map((l) => [l.id!, l.name]));
+
+    const existingFronts = new Map<string, { id: number; lessonName: string }>();
+    for (const c of allDbCards) {
+      const norm = normalizeFront(c.front);
+      if (!existingFronts.has(norm)) {
+        existingFronts.set(norm, { id: c.id!, lessonName: lessonMap.get(c.lesson_id) ?? '' });
+      }
+    }
+
+    const seen = new Set<string>();
+    const deduplicated: ExtractedCard[] = [];
+    for (const card of extractedCards) {
+      const norm = normalizeFront(card.front);
+      if (seen.has(norm)) {
+        continue;
+      }
+      seen.add(norm);
+
+      const existing = existingFronts.get(norm);
+      if (existing) {
+        card.existing_in = existing.lessonName;
+        card.existing_card_id = existing.id;
+      }
+      deduplicated.push(card);
+    }
+
     return {
-      cards: [],
-      model: 'gemini-flash-latest',
-      hint: hint ?? '',
+      cards: deduplicated,
+      model,
+      hint: truncatedHint,
     };
   },
 
   async settings(): Promise<Settings> {
     const all = await db.settings.toArray();
-    const map = new Map(all.map(s => [s.key, s.value]));
+    const map = new Map(all.map((s) => [s.key, s.value]));
 
     const front_lang = map.get('front_lang') ?? DEFAULT_SETTINGS.front_lang;
     const back_lang = map.get('back_lang') ?? DEFAULT_SETTINGS.back_lang;
@@ -781,16 +914,7 @@ export const localApi: FiszkiApi = {
     const extract_daily_cap = parseInt(map.get('extract_daily_cap') ?? map.get('gemini_daily_limit') ?? DEFAULT_SETTINGS.gemini_daily_limit, 10);
     const theme = (map.get('theme') as any) ?? DEFAULT_SETTINGS.theme;
 
-    const usages = await db.usage.toArray();
-    const todayStr = new Date().toISOString().slice(0, 10);
-    let extractions_today = 0;
-    let extractions_total = 0;
-    for (const u of usages) {
-      extractions_total += u.count;
-      if (u.day === todayStr) {
-        extractions_today = u.count;
-      }
-    }
+    const usage = await getExtractionUsage(nowTs());
 
     return {
       front_lang,
@@ -802,14 +926,14 @@ export const localApi: FiszkiApi = {
       gemini_api_key_set,
       last_lesson_id,
       extraction_paused,
-      extractions_today,
-      extractions_total,
+      extractions_today: usage.today,
+      extractions_total: usage.total,
       extract_daily_cap,
       theme,
     };
   },
 
-  async patchSettings(p: SettingsPatch & { gemini_api_key?: string }): Promise<Settings> {
+  async patchSettings(p: SettingsPatch): Promise<Settings> {
     if (p.front_lang !== undefined) {
       const v = p.front_lang.trim();
       if (!v) throw new ApiError(400, 'validation', 'front_lang cannot be empty');
@@ -851,10 +975,26 @@ export const localApi: FiszkiApi = {
       await setSettingValue('theme', t);
     }
     if (p.gemini_model !== undefined) {
-      await setSettingValue('gemini_model', p.gemini_model.trim());
+      try {
+        const m = cleanModel(p.gemini_model);
+        await setSettingValue('gemini_model', m);
+      } catch (e: any) {
+        throw new ApiError(400, 'validation', e.message);
+      }
     }
     if (p.gemini_api_key !== undefined) {
       await setSettingValue('gemini_api_key', p.gemini_api_key.trim());
+    }
+    if (p.extract_daily_cap !== undefined) {
+      if (p.extract_daily_cap < 0 || p.extract_daily_cap > 1000) {
+        throw new ApiError(400, 'validation', 'extract_daily_cap must be between 0 and 1000');
+      }
+      await setSettingValue('extract_daily_cap', String(p.extract_daily_cap));
+      await setSettingValue('gemini_daily_limit', String(p.extract_daily_cap));
+    }
+    if (p.gemini_rpm_limit !== undefined) {
+      rateLimiter.setMax(p.gemini_rpm_limit);
+      await setSettingValue('gemini_rpm_limit', String(p.gemini_rpm_limit));
     }
     return this.settings();
   },

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Icon } from '../components/Icon';
 import { Button, Label, Toggle, TopBar } from '../components/ui';
-import { api } from '../lib/api';
+import { api, isLocalBackend } from '../lib/api';
 import { useStore } from '../lib/store';
 import type { Theme } from '../lib/theme';
 import type { Settings as SettingsData, SettingsPatch } from '../lib/types';
@@ -22,8 +22,16 @@ if (typeof window !== 'undefined') {
 export function Settings() {
   const { settings, setSettings, overview, toast, refresh } = useStore();
   const [canInstall, setCanInstall] = useState(!!deferredInstall);
+  const [apiKeyInput, setApiKeyInput] = useState('');
+  const [modelInput, setModelInput] = useState(settings?.gemini_model ?? 'gemini-flash-latest');
   const importRef = useRef<HTMLInputElement>(null);
   const installed = typeof window !== 'undefined' && (window.matchMedia('(display-mode: standalone)').matches || (navigator as { standalone?: boolean }).standalone === true);
+
+  useEffect(() => {
+    if (settings?.gemini_model) {
+      setModelInput(settings.gemini_model);
+    }
+  }, [settings?.gemini_model]);
 
   useEffect(() => {
     const h = (e: Event) => {
@@ -148,14 +156,117 @@ export function Settings() {
 
         <Label>Gemini (photo extraction)</Label>
         <Section>
-          <Row title="API key" text={settings.gemini_api_key_set ? 'Configured via GEMINI_API_KEY on the server' : 'Not set – add GEMINI_API_KEY to the server’s .env and restart'}>
-            <span className={`px-2.5 py-1 rounded-full text-label-sm font-bold ${settings.gemini_api_key_set ? 'bg-tertiary-fixed text-on-tertiary-fixed' : 'bg-error-container text-on-error-container'}`}>
-              {settings.gemini_api_key_set ? 'configured' : 'missing'}
-            </span>
-          </Row>
-          <Row title="Model" text="Set with FISZKI_GEMINI_MODEL on the server">
-            <code className="text-label-lg text-on-surface whitespace-nowrap">{settings.gemini_model}</code>
-          </Row>
+          {isLocalBackend ? (
+            <div className="py-3 flex flex-col gap-2.5">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex-1 min-w-0">
+                  <div className="text-body-md font-semibold text-on-surface">API key</div>
+                  <div className="text-body-sm text-on-surface-variant">
+                    {settings.gemini_api_key_set ? 'Stored locally in this browser' : 'Required for photo card extraction'}
+                  </div>
+                </div>
+                <span className={`px-2.5 py-1 rounded-full text-label-sm font-bold shrink-0 ${settings.gemini_api_key_set ? 'bg-tertiary-fixed text-on-tertiary-fixed' : 'bg-error-container text-on-error-container'}`}>
+                  {settings.gemini_api_key_set ? 'configured' : 'missing'}
+                </span>
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  type="password"
+                  className="flex-1 min-w-0 bg-surface-container rounded-full px-3.5 h-10 text-body-md text-on-surface outline-none"
+                  placeholder={settings.gemini_api_key_set ? '••••••••••••••••' : 'Paste Gemini API key (AIza...)'}
+                  value={apiKeyInput}
+                  onChange={(e) => setApiKeyInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && apiKeyInput.trim()) {
+                      void (async () => {
+                        await patch({ gemini_api_key: apiKeyInput.trim() }, 'API key saved');
+                        setApiKeyInput('');
+                      })();
+                    }
+                  }}
+                />
+                {apiKeyInput.trim() ? (
+                  <Button
+                    size="sm"
+                    onClick={async () => {
+                      await patch({ gemini_api_key: apiKeyInput.trim() }, 'API key saved');
+                      setApiKeyInput('');
+                    }}
+                  >
+                    Save
+                  </Button>
+                ) : settings.gemini_api_key_set ? (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={async () => {
+                      if (window.confirm('Remove your Gemini API key from this device?')) {
+                        await patch({ gemini_api_key: '' }, 'API key removed');
+                      }
+                    }}
+                  >
+                    Clear
+                  </Button>
+                ) : null}
+              </div>
+            </div>
+          ) : (
+            <Row title="API key" text={settings.gemini_api_key_set ? 'Configured via GEMINI_API_KEY on the server' : 'Not set – add GEMINI_API_KEY to the server’s .env and restart'}>
+              <span className={`px-2.5 py-1 rounded-full text-label-sm font-bold ${settings.gemini_api_key_set ? 'bg-tertiary-fixed text-on-tertiary-fixed' : 'bg-error-container text-on-error-container'}`}>
+                {settings.gemini_api_key_set ? 'configured' : 'missing'}
+              </span>
+            </Row>
+          )}
+
+          {isLocalBackend ? (
+            <Row title="Model" text="Gemini model used for extraction">
+              <div className="flex items-center gap-2">
+                <input
+                  className="bg-surface-container rounded-full px-3 h-10 text-label-lg text-on-surface outline-none text-right w-[180px]"
+                  value={modelInput}
+                  onChange={(e) => setModelInput(e.target.value)}
+                  onBlur={() => {
+                    const val = modelInput.trim();
+                    if (val && val !== settings.gemini_model) {
+                      void patch({ gemini_model: val });
+                    }
+                  }}
+                  onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
+                  list="gemini-models"
+                />
+                <datalist id="gemini-models">
+                  <option value="gemini-flash-latest" />
+                  <option value="gemini-flash-lite-latest" />
+                  <option value="gemini-2.5-pro" />
+                  <option value="gemini-2.0-flash" />
+                </datalist>
+              </div>
+            </Row>
+          ) : (
+            <Row title="Model" text="Set with FISZKI_GEMINI_MODEL on the server">
+              <code className="text-label-lg text-on-surface whitespace-nowrap">{settings.gemini_model}</code>
+            </Row>
+          )}
+
+          {isLocalBackend && (
+            <Row title="Daily extraction cap" text="Safety limit for photo extractions">
+              <select
+                aria-label="Daily extraction cap"
+                className="bg-surface-container rounded-full px-3 h-10 text-label-lg text-on-surface outline-none"
+                value={settings.extract_daily_cap}
+                onChange={(e) => void patch({ extract_daily_cap: Number(e.target.value) })}
+              >
+                <option value={0}>Unlimited</option>
+                <option value={10}>10 / day</option>
+                <option value={25}>25 / day</option>
+                <option value={50}>50 / day</option>
+                <option value={60}>60 / day</option>
+                <option value={100}>100 / day</option>
+                <option value={200}>200 / day</option>
+              </select>
+            </Row>
+          )}
+
           <Row title="Pause extraction" text={settings.extraction_paused ? 'Photo requests are rejected' : 'Kill switch for the Gemini key'}>
             <Toggle on={settings.extraction_paused} onChange={(v) => void patch({ extraction_paused: v }, v ? 'Extraction paused' : 'Extraction resumed')} label="Pause extraction" />
           </Row>
@@ -167,8 +278,9 @@ export function Settings() {
           </Row>
         </Section>
         <p className="text-body-sm text-on-surface-variant mt-2 px-1">
-          The key and model are read-only here on purpose: nothing that can be done from the app (or with a stolen password) can change or reveal them. The daily cap and per-minute limit are also server settings (<code>FISZKI_EXTRACT_DAILY_CAP</code>,{' '}
-          <code>FISZKI_EXTRACT_PER_MINUTE</code>); protect the whole app with <code>FISZKI_BASIC_AUTH=user:password</code> before exposing it.
+          {isLocalBackend
+            ? "Your API key is stored only in this browser on your device and sent directly to Google's Gemini API over HTTPS."
+            : 'The key and model are read-only here on purpose: nothing that can be done from the app (or with a stolen password) can change or reveal them. The daily cap and per-minute limit are also server settings (FISZKI_EXTRACT_DAILY_CAP, FISZKI_EXTRACT_PER_MINUTE); protect the whole app with FISZKI_BASIC_AUTH=user:password before exposing it.'}
         </p>
 
         <Label>Data</Label>
@@ -176,7 +288,9 @@ export function Settings() {
           <button type="button" onClick={() => void exportBackup()} className="w-full flex items-center gap-3 min-h-[60px] text-left">
             <div className="flex-1">
               <div className="text-body-md font-semibold text-on-surface">Export backup (JSON)</div>
-              <div className="text-body-sm text-on-surface-variant">{overview?.total ?? 0} cards · stored on your server</div>
+              <div className="text-body-sm text-on-surface-variant">
+                {overview?.total ?? 0} cards · stored on {isLocalBackend ? 'this device' : 'your server'}
+              </div>
             </div>
             <Icon name="download" size={22} className="text-on-surface-variant" />
           </button>

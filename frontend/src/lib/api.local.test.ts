@@ -328,4 +328,135 @@ describe('localApi (IndexedDB)', () => {
     await expect(localApi.patchSettings({ new_per_day: -5 })).rejects.toThrow('between 0 and 500');
     await expect(localApi.patchSettings({ study_direction: 'diagonal' as any })).rejects.toThrow('study_direction must be');
   });
+
+  describe('extract (Gemini integration & safeguards)', () => {
+    it('requires Gemini API key', async () => {
+      await expect(
+        localApi.extract([{ mime_type: 'image/jpeg', data: 'dGVzdA==' }], '')
+      ).rejects.toThrow('Gemini API key is not configured');
+    });
+
+    it('validates image inputs', async () => {
+      await localApi.patchSettings({ gemini_api_key: 'test-key' });
+
+      await expect(localApi.extract([], '')).rejects.toThrow('at least one image is required');
+      await expect(
+        localApi.extract(
+          [
+            { mime_type: 'image/jpeg', data: 'a' },
+            { mime_type: 'image/jpeg', data: 'b' },
+            { mime_type: 'image/jpeg', data: 'c' },
+            { mime_type: 'image/jpeg', data: 'd' },
+            { mime_type: 'image/jpeg', data: 'e' },
+          ],
+          ''
+        )
+      ).rejects.toThrow('at most 4 images');
+      await expect(
+        localApi.extract([{ mime_type: 'application/pdf', data: 'dGVzdA==' }], '')
+      ).rejects.toThrow('unsupported image type');
+      await expect(
+        localApi.extract([{ mime_type: 'image/jpeg', data: '' }], '')
+      ).rejects.toThrow('empty image');
+    });
+
+    it('enforces extraction pause killswitch', async () => {
+      await localApi.patchSettings({ gemini_api_key: 'test-key', extraction_paused: true });
+      await expect(
+        localApi.extract([{ mime_type: 'image/jpeg', data: 'dGVzdA==' }], '')
+      ).rejects.toThrow('Extraction is paused');
+    });
+
+    it('enforces daily cap limit', async () => {
+      await localApi.patchSettings({ gemini_api_key: 'test-key', extract_daily_cap: 1 });
+
+      const fakeResponse = {
+        candidates: [
+          {
+            content: {
+              parts: [{ text: JSON.stringify([{ front: 'uno', back: 'jeden' }]) }],
+            },
+          },
+        ],
+      };
+
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = async () =>
+        new Response(JSON.stringify(fakeResponse), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+
+      try {
+        // First extraction succeeds and records usage
+        const res1 = await localApi.extract([{ mime_type: 'image/jpeg', data: 'dGVzdA==' }], '');
+        expect(res1.cards.length).toBe(1);
+
+        // Second extraction hits daily cap
+        await expect(
+          localApi.extract([{ mime_type: 'image/jpeg', data: 'dGVzdA==' }], '')
+        ).rejects.toThrow('Daily extraction limit reached');
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+
+    it('detects duplicate fronts and normalizes whitespace/casing', async () => {
+      const unit = await localApi.createUnit('Unidad 9');
+      const lesson = await localApi.createLesson(unit.id, '9.1 Animales');
+      const existingCard = await localApi.createCard(lesson.id, {
+        front: '  El   Gato  ',
+        back: 'kot',
+      });
+
+      await localApi.patchSettings({ gemini_api_key: 'test-key' });
+
+      const fakeResponse = {
+        candidates: [
+          {
+            content: {
+              parts: [
+                {
+                  text: JSON.stringify([
+                    { front: 'el gato', back: 'kot domowy' },
+                    { front: 'el perro', back: 'pies', example: 'El perro ladra.' },
+                  ]),
+                },
+              ],
+            },
+          },
+        ],
+      };
+
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = async () =>
+        new Response(JSON.stringify(fakeResponse), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+
+      try {
+        const result = await localApi.extract([{ mime_type: 'image/jpeg', data: 'dGVzdA==' }], '');
+
+        expect(result.cards.length).toBe(2);
+        // First item is marked as duplicate
+        expect(result.cards[0].front).toBe('el gato');
+        expect(result.cards[0].existing_in).toBe('9.1 Animales');
+        expect(result.cards[0].existing_card_id).toBe(existingCard.id);
+
+        // Second item is new
+        expect(result.cards[1].front).toBe('el perro');
+        expect(result.cards[1].existing_in).toBeNull();
+        expect(result.cards[1].existing_card_id).toBeNull();
+        expect(result.cards[1].example).toBe('El perro ladra.');
+
+        // Usage is recorded
+        const settings = await localApi.settings();
+        expect(settings.extractions_today).toBe(1);
+        expect(settings.extractions_total).toBe(1);
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+  });
 });

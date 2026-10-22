@@ -97,9 +97,11 @@ export interface Settings {
   theme: Theme;
 }
 
-export type SettingsPatch = Partial<Omit<Settings, 'gemini_model' | 'gemini_api_key_set' | 'extractions_today' | 'extractions_total' | 'extract_daily_cap'>> & {
+export type SettingsPatch = Partial<Omit<Settings, 'gemini_model' | 'gemini_api_key_set' | 'extractions_today' | 'extractions_total'>> & {
   gemini_model?: string;
   gemini_api_key?: string;
+  extract_daily_cap?: number;
+  gemini_rpm_limit?: number;
 };
 
 export interface Preview {
