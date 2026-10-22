@@ -3,6 +3,7 @@ import { Icon } from '../components/Icon';
 import { Button, Label, Toggle, TopBar, fieldClass } from '../components/ui';
 import { api } from '../lib/api';
 import { useStore } from '../lib/store';
+import type { Theme } from '../lib/theme';
 import type { Settings as SettingsData, SettingsPatch } from '../lib/types';
 
 interface BeforeInstallPromptEvent extends Event {
@@ -115,6 +116,22 @@ export function Settings() {
     <div className="min-h-dvh bg-surface pb-10">
       <TopBar title="Settings" back />
       <main className="max-w-app mx-auto px-margin-mobile">
+        <Label>Appearance</Label>
+        <Section>
+          <Row title="Theme" text={settings.theme === 'light' ? 'Light (default)' : settings.theme === 'dark' ? 'Dark' : 'Follows your device setting'}>
+            <select
+              className="bg-surface-container rounded-full px-3 h-10 text-label-lg text-on-surface outline-none"
+              aria-label="Theme"
+              value={settings.theme}
+              onChange={(e) => void patch({ theme: e.target.value as Theme })}
+            >
+              <option value="light">Light</option>
+              <option value="dark">Dark</option>
+              <option value="system">System</option>
+            </select>
+          </Row>
+        </Section>
+
         <Label>Card sides</Label>
         <Section>
           <Row title="Front language" text="What you see first">

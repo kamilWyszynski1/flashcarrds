@@ -1,5 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api } from './api';
+import { DEFAULT_THEME, applyTheme, isTheme, watchSystemTheme } from './theme';
 import type { ExtractedCard, Overview, Settings } from './types';
 
 /** Cards waiting on the Review screen (from a photo or a pasted list). */
@@ -100,6 +101,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     document.addEventListener('visibilitychange', onVisible);
     return () => document.removeEventListener('visibilitychange', onVisible);
   }, [refresh]);
+
+  // Theme: server setting → <html class="dark"> (see lib/theme.ts). Until the
+  // settings arrive the inline script in index.html has already applied the
+  // cached preference, so there is no flash for returning users.
+  const themePref = settings?.theme;
+  useEffect(() => {
+    if (themePref === undefined) return;
+    const pref = isTheme(themePref) ? themePref : DEFAULT_THEME;
+    applyTheme(pref);
+    return watchSystemTheme(pref);
+  }, [themePref]);
 
   // Default target: last used lesson (server), else first lesson that exists.
   useEffect(() => {

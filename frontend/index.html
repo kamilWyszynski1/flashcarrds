@@ -3,8 +3,19 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
-    <meta name="theme-color" content="#f8f9ff" media="(prefers-color-scheme: light)" />
-    <meta name="theme-color" content="#0f141f" media="(prefers-color-scheme: dark)" />
+    <!-- Light (Stitch design) by default; src/lib/theme.ts updates this when the user opts into Dark. -->
+    <meta name="theme-color" content="#f8f9ff" />
+    <script>
+      // Apply the cached theme preference before first paint. Must stay in sync
+      // with THEME_KEY / THEME_COLOR in src/lib/theme.ts. No preference = light.
+      try {
+        var t = localStorage.getItem('fiszki.theme');
+        if (t === 'dark' || (t === 'system' && matchMedia('(prefers-color-scheme: dark)').matches)) {
+          document.documentElement.classList.add('dark');
+          document.querySelector('meta[name="theme-color"]').content = '#0f141f';
+        }
+      } catch (e) {}
+    </script>
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="default" />

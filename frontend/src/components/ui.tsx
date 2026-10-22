@@ -9,7 +9,7 @@ import { Icon, type IconName } from './Icon';
 type Variant = 'primary' | 'tonal' | 'outline' | 'ghost' | 'danger';
 
 const variants: Record<Variant, string> = {
-  primary: 'bg-primary-container text-on-primary hover:bg-primary shadow-md',
+  primary: 'bg-primary-container text-on-primary hover:bg-primary dark:hover:bg-primary-container dark:hover:brightness-110 shadow-md',
   tonal: 'bg-primary-fixed text-on-primary-fixed-variant',
   outline: 'border border-outline-variant text-on-surface bg-transparent',
   ghost: 'text-primary bg-transparent',
@@ -22,13 +22,16 @@ export function Button({
   children,
   icon,
   size = 'md',
+  shape = 'pill',
   ...rest
-}: ButtonHTMLAttributes<HTMLButtonElement> & { variant?: Variant; icon?: IconName; size?: 'md' | 'lg' | 'sm' }) {
+}: ButtonHTMLAttributes<HTMLButtonElement> & { variant?: Variant; icon?: IconName; size?: 'md' | 'lg' | 'sm'; shape?: 'pill' | 'rounded' }) {
   const h = size === 'lg' ? 'h-[60px]' : size === 'sm' ? 'h-10 px-4 text-label-md' : 'h-[52px]';
+  // Stitch: the hero "Study now" is a 12 px rounded rectangle; secondary actions stay pills.
+  const r = shape === 'rounded' ? 'rounded-xl' : 'rounded-full';
   return (
     <button
       type="button"
-      className={`inline-flex items-center justify-center gap-2 rounded-full px-5 font-body text-label-lg font-semibold transition-[transform,filter] active:scale-[0.98] disabled:opacity-40 disabled:pointer-events-none ${h} ${variants[variant]} ${className}`}
+      className={`inline-flex items-center justify-center gap-2 ${r} px-5 font-body text-label-lg font-semibold transition-[transform,filter] active:scale-[0.98] disabled:opacity-40 disabled:pointer-events-none ${h} ${variants[variant]} ${className}`}
       {...rest}
     >
       {icon && <Icon name={icon} size={20} />}
@@ -60,12 +63,15 @@ export function TopBar({
   subtitle,
   back,
   onBack,
+  leading,
   right,
 }: {
   title: ReactNode;
   subtitle?: ReactNode;
   back?: boolean;
   onBack?: () => void;
+  /** Rendered before the title (Stitch Home shows the app icon here). */
+  leading?: ReactNode;
   right?: ReactNode;
 }) {
   const navigate = useNavigate();
@@ -73,7 +79,8 @@ export function TopBar({
     <header className="sticky top-0 z-30 pt-safe-top bg-surface/85 backdrop-blur-xl shadow-[0_1px_8px_rgba(0,0,0,0.04)]">
       <div className="h-16 px-2 flex items-center gap-1 max-w-app mx-auto">
         {back && <IconButton icon="back" label="Back" onClick={onBack ?? (() => navigate(-1))} />}
-        <div className={`flex-1 min-w-0 flex flex-col ${back ? '' : 'pl-3'}`}>
+        {leading && <div className={`shrink-0 ${back ? '' : 'pl-2'}`}>{leading}</div>}
+        <div className={`flex-1 min-w-0 flex flex-col ${back || leading ? 'pl-1' : 'pl-3'}`}>
           <h1 className="font-display text-headline-sm font-bold text-on-surface truncate">{title}</h1>
           {subtitle && <span className="font-body text-label-sm text-on-surface-variant truncate">{subtitle}</span>}
         </div>
@@ -121,7 +128,7 @@ export function Fab({ icon, label, onClick, className = '' }: { icon: IconName; 
         type="button"
         aria-label={label}
         onClick={onClick}
-        className="h-14 px-5 rounded-full bg-primary-container text-on-primary flex items-center gap-2 shadow-float hover:bg-primary active:scale-95 transition-all"
+        className="h-14 px-5 rounded-full bg-primary-container text-on-primary flex items-center gap-2 shadow-float hover:bg-primary dark:hover:bg-primary-container dark:hover:brightness-110 active:scale-95 transition-all"
       >
         <Icon name={icon} />
         <span className="text-label-lg font-semibold tracking-wide">{label}</span>
@@ -194,7 +201,7 @@ export function Toggle({ on, onChange, label }: { on: boolean; onChange: (v: boo
 export function Card({ children, className = '', onClick }: { children: ReactNode; className?: string; onClick?: () => void }) {
   const Tag = onClick ? 'button' : 'div';
   return (
-    <Tag type={onClick ? 'button' : undefined} onClick={onClick} className={`block w-full text-left rounded-2xl bg-surface-container-lowest shadow-card ${className}`}>
+    <Tag type={onClick ? 'button' : undefined} onClick={onClick} className={`block w-full text-left rounded-xl bg-surface-container-lowest shadow-card ${className}`}>
       {children}
     </Tag>
   );

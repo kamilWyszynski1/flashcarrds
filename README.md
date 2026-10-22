@@ -31,8 +31,9 @@ flashcarrds/
    interval shown, in-session re-queue of missed cards, session summary with
    "repeat the missed".
 
-Also: installable PWA (offline shell + last-known lists), dark mode, Android
-back gesture closes sheets/screens like a native app, JSON backup
+Also: installable PWA (offline shell + last-known lists), theme setting
+(Light by default – the Stitch design; Dark / System are opt-in in Settings),
+Android back gesture closes sheets/screens like a native app, JSON backup
 export/import, languages are a setting (defaults Español → Polski; change to
 Polski → English or anything else in Settings).
 

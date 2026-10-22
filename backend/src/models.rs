@@ -105,6 +105,13 @@ pub struct Settings {
     /// Max extraction attempts per local day (from `FISZKI_EXTRACT_DAILY_CAP`; 0 = unlimited).
     #[serde(default)]
     pub extract_daily_cap: i64,
+    /// UI colour theme: "light" (default – the Stitch design) | "dark" | "system".
+    #[serde(default = "default_theme")]
+    pub theme: String,
+}
+
+pub fn default_theme() -> String {
+    crate::repo::DEFAULT_THEME.to_string()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -119,6 +126,7 @@ pub struct SettingsPatch {
     pub gemini_api_key: Option<String>,
     pub last_lesson_id: Option<i64>,
     pub extraction_paused: Option<bool>,
+    pub theme: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

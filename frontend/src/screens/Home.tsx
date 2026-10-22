@@ -21,6 +21,7 @@ export function Home() {
   return (
     <div className="min-h-dvh bg-surface pb-48">
       <TopBar
+        leading={<img src="/icons/icon.svg" alt="" aria-hidden="true" className="h-8 w-8 rounded-lg" />}
         title={
           <span className="flex items-center gap-1.5">
             Fiszki <span className="text-outline-variant font-normal">•</span> <span className="text-label-md text-on-surface-variant font-medium">Groups</span>
@@ -41,7 +42,7 @@ export function Home() {
         {overview && (
           <>
             {/* Due today hero */}
-            <section className="relative overflow-hidden rounded-2xl bg-surface-container-low shadow-card">
+            <section className="relative overflow-hidden rounded-xl bg-surface-container-low shadow-card">
               <div className="p-5 relative z-10">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-1.5">
@@ -73,7 +74,8 @@ export function Home() {
                     <span>All caught up – come back tomorrow or practise a group.</span>
                   )}
                 </p>
-                <Button size="lg" className="w-full h-14" icon="play" onClick={() => navigate('/study?scope=all')} disabled={todo === 0}>
+                <Button size="lg" shape="rounded" className="w-full h-14" onClick={() => navigate('/study?scope=all')} disabled={todo === 0}>
+                  <Icon name="play" size={20} fill="currentColor" strokeWidth={1.5} />
                   Study now
                 </Button>
               </div>

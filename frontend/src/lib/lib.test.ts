@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { applyGrade, createSession, current, isFinished, progress, summarize, REQUEUE_GAP } from './session';
 import { parsePairs } from './paste';
 import { fmtInterval, lessonMeta } from './format';
+import { DEFAULT_THEME, THEMES, THEME_COLOR, THEME_KEY, applyTheme, isTheme, resolveTheme } from './theme';
 import type { Card, StudyItem } from './types';
 
 const item = (id: number): StudyItem => ({
@@ -135,5 +136,51 @@ describe('format', () => {
     expect(lessonMeta({ total: 41, new: 0, due: 7, learned: 10 })).toBe('41 cards · 7 due');
     expect(lessonMeta({ total: 32, new: 0, due: 0, learned: 32 })).toBe('32 cards · all learned');
     expect(lessonMeta({ total: 1, new: 1, due: 0, learned: 0 })).toBe('1 card · 1 new');
+  });
+});
+
+describe('theme', () => {
+  it('defaults to light and only system follows the OS', () => {
+    expect(DEFAULT_THEME).toBe('light');
+    expect(resolveTheme('light', true)).toBe('light');
+    expect(resolveTheme('dark', false)).toBe('dark');
+    expect(resolveTheme('system', true)).toBe('dark');
+    expect(resolveTheme('system', false)).toBe('light');
+  });
+  it('isTheme rejects anything the server would not store', () => {
+    for (const t of THEMES) expect(isTheme(t)).toBe(true);
+    expect(isTheme('auto')).toBe(false);
+    expect(isTheme('')).toBe(false);
+    expect(isTheme(undefined)).toBe(false);
+    expect(isTheme(1)).toBe(false);
+  });
+  it('applyTheme toggles html.dark, theme-color and caches the preference', () => {
+    const cls = new Set<string>();
+    const meta = { content: '' };
+    const store = new Map<string, string>();
+    const g = globalThis as Record<string, unknown>;
+    const saved = { document: g.document, window: g.window, localStorage: g.localStorage };
+    g.document = {
+      documentElement: { classList: { toggle: (c: string, on: boolean) => (on ? cls.add(c) : cls.delete(c)) } },
+      querySelectorAll: () => [meta],
+    };
+    g.window = { matchMedia: () => ({ matches: true, addEventListener() {}, removeEventListener() {} }) };
+    g.localStorage = { setItem: (k: string, v: string) => store.set(k, v), getItem: (k: string) => store.get(k) ?? null };
+    try {
+      expect(applyTheme('light')).toBe('light');
+      expect(cls.has('dark')).toBe(false);
+      expect(meta.content).toBe(THEME_COLOR.light);
+      expect(store.get(THEME_KEY)).toBe('light');
+      // OS prefers dark (matchMedia above) but an explicit Light must win.
+      expect(applyTheme('system')).toBe('dark');
+      expect(cls.has('dark')).toBe(true);
+      expect(meta.content).toBe(THEME_COLOR.dark);
+      expect(applyTheme('light')).toBe('light');
+      expect(cls.has('dark')).toBe(false);
+    } finally {
+      g.document = saved.document;
+      g.window = saved.window;
+      g.localStorage = saved.localStorage;
+    }
   });
 });

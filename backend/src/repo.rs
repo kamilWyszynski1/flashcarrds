@@ -474,6 +474,19 @@ pub fn clean_model(m: &str) -> Result<String> {
     Ok(m.to_string())
 }
 
+/// The Stitch design only exists in light; dark is an opt-in derived palette,
+/// so a fresh install must never auto-switch on `prefers-color-scheme`.
+pub const DEFAULT_THEME: &str = "light";
+pub const THEMES: [&str; 3] = ["light", "dark", "system"];
+
+pub fn clean_theme(t: &str) -> Result<String> {
+    let t = t.trim().to_ascii_lowercase();
+    if !THEMES.contains(&t.as_str()) {
+        return Err(anyhow!("theme must be one of {}", THEMES.join(", ")));
+    }
+    Ok(t)
+}
+
 fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>> {
     Ok(conn.query_row("SELECT value FROM settings WHERE key=?1", [key], |r| r.get(0)).optional()?)
 }
@@ -515,6 +528,7 @@ pub fn get_settings(conn: &Connection) -> Result<Settings> {
         extractions_today: usage.today,
         extractions_total: usage.total,
         extract_daily_cap: 0,
+        theme: get_setting(conn, "theme")?.and_then(|t| clean_theme(&t).ok()).unwrap_or_else(|| DEFAULT_THEME.into()),
     })
 }
 
@@ -561,6 +575,9 @@ pub fn patch_settings(conn: &Connection, p: &SettingsPatch) -> Result<Settings> 
     }
     if let Some(v) = p.extraction_paused {
         set_setting(conn, "extraction_paused", if v { "true" } else { "false" })?;
+    }
+    if let Some(v) = &p.theme {
+        set_setting(conn, "theme", &clean_theme(v)?)?;
     }
     get_settings(conn)
 }
@@ -1093,6 +1110,25 @@ mod tests {
         assert_eq!(s.gemini_model, DEFAULT_MODEL, "empty resets to default");
         assert!(clean_model("models/").is_err());
         assert_eq!(clean_model("gemini-2.0-flash_exp.v1").unwrap(), "gemini-2.0-flash_exp.v1");
+    }
+
+    #[test]
+    fn theme_defaults_to_light_and_is_validated() {
+        let c = conn();
+        assert_eq!(get_settings(&c).unwrap().theme, "light", "fresh install must show the Stitch light design");
+        for t in THEMES {
+            let s = patch_settings(&c, &SettingsPatch { theme: Some(t.into()), ..Default::default() }).unwrap();
+            assert_eq!(s.theme, t);
+        }
+        let s = patch_settings(&c, &SettingsPatch { theme: Some("  Dark ".into()), ..Default::default() }).unwrap();
+        assert_eq!(s.theme, "dark", "trimmed and lower-cased");
+        let e = patch_settings(&c, &SettingsPatch { theme: Some("sepia".into()), ..Default::default() }).unwrap_err().to_string();
+        assert!(e.contains("light, dark, system"), "{e}");
+        assert!(patch_settings(&c, &SettingsPatch { theme: Some("".into()), ..Default::default() }).is_err());
+        assert_eq!(get_settings(&c).unwrap().theme, "dark", "rejected value did not overwrite");
+        // Garbage written directly to the table (e.g. older build) falls back to the default.
+        set_setting(&c, "theme", "neon").unwrap();
+        assert_eq!(get_settings(&c).unwrap().theme, DEFAULT_THEME);
     }
 
     #[test]

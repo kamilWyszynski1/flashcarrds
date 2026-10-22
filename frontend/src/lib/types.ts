@@ -1,5 +1,7 @@
 // Types mirroring the Rust API (backend/src/models.rs).
 
+import type { Theme } from './theme';
+
 export type Status = 'new' | 'due' | 'learning' | 'learned';
 export type Grade = 'again' | 'hard' | 'good' | 'easy';
 export type Direction = 'forward' | 'reverse';
@@ -89,6 +91,8 @@ export interface Settings {
   extractions_total: number;
   /** Server-side daily cap (env `FISZKI_EXTRACT_DAILY_CAP`); 0 = unlimited. */
   extract_daily_cap: number;
+  /** Colour theme; "light" is the default (Stitch design), the others are opt-in. */
+  theme: Theme;
 }
 
 export type SettingsPatch = Partial<Omit<Settings, 'gemini_api_key_set' | 'gemini_api_key_hint' | 'extractions_today' | 'extractions_total' | 'extract_daily_cap'>> & {

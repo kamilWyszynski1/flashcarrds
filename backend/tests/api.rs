@@ -432,6 +432,20 @@ async fn settings_validate_model_name() {
     assert_eq!(v["gemini_model"], "gemini-flash-latest", "empty resets to default");
 }
 
+#[tokio::test]
+async fn settings_theme_defaults_to_light() {
+    let app = app();
+    let (_, s) = call(&app, "GET", "/api/settings", None).await;
+    assert_eq!(s["theme"], "light", "fresh install must not auto-switch to dark");
+    let (st, v) = call(&app, "PATCH", "/api/settings", Some(json!({"theme": "system"}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["theme"], "system");
+    let (st, v) = call(&app, "PATCH", "/api/settings", Some(json!({"theme": "blue"}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (_, s) = call(&app, "GET", "/api/settings", None).await;
+    assert_eq!(s["theme"], "system", "rejected value did not overwrite");
+}
+
 async fn call_with_auth(app: &Router, path: &str, auth: Option<&str>) -> (StatusCode, Option<String>, Value) {
     let mut req = Request::builder().method("GET").uri(path);
     if let Some(a) = auth {

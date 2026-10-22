@@ -3,8 +3,11 @@ import plugin from 'tailwindcss/plugin';
 
 // Design tokens from the Stitch export (Home screen) – Material-3 colour roles,
 // Inter for body/labels, Plus Jakarta Sans for headlines and the flashcard.
-// Colours are exposed as CSS variables (RGB triplets) so `bg-primary/20` works
-// and the dark theme is a plain variable swap on prefers-color-scheme.
+// Colours are exposed as CSS variables (RGB triplets) so `bg-primary/20` works.
+// Stitch only produced a light design; the dark palette below is derived and
+// strictly opt-in: it is a plain variable swap under `html.dark`, which
+// `src/lib/theme.ts` toggles from the "Theme" setting (default Light). Nothing
+// here reacts to `prefers-color-scheme` on its own.
 
 const light = {
   primary: '#3525cd',
@@ -69,7 +72,9 @@ const light = {
 const dark = {
   ...light,
   primary: '#c3c0ff',
-  'on-primary': '#1e0c9c',
+  // `text-on-primary` is only ever used on `bg-primary-container`, which stays
+  // #4f46e5 in dark, so the label must stay white (M3's #1e0c9c was invisible).
+  'on-primary': '#ffffff',
   'primary-container': '#4f46e5',
   'on-primary-container': '#e2dfff',
   'inverse-primary': '#3525cd',
@@ -121,7 +126,7 @@ const colors = Object.fromEntries(Object.keys(light).map((k) => [k, `rgb(var(--c
 
 export default {
   content: ['./index.html', './src/**/*.{ts,tsx}'],
-  darkMode: 'media',
+  darkMode: 'class',
   theme: {
     extend: {
       colors,
@@ -180,7 +185,7 @@ export default {
     plugin(({ addBase }) => {
       addBase({
         ':root': { ...vars(light), colorScheme: 'light' },
-        '@media (prefers-color-scheme: dark)': { ':root': { ...vars(dark), colorScheme: 'dark' } },
+        ':root.dark': { ...vars(dark), colorScheme: 'dark' },
       });
     }),
   ],
