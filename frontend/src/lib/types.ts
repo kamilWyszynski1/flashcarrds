@@ -46,6 +46,7 @@ export interface Card {
   last_review: number | null;
   created_at: number;
   updated_at: number;
+  interval_label?: string;
 }
 
 export interface LessonOverview extends Counts {
@@ -96,8 +97,10 @@ export interface Settings {
   theme: Theme;
 }
 
-/** Only the user-editable fields – the key and model are server configuration and the API rejects them. */
-export type SettingsPatch = Partial<Omit<Settings, 'gemini_model' | 'gemini_api_key_set' | 'extractions_today' | 'extractions_total' | 'extract_daily_cap'>>;
+export type SettingsPatch = Partial<Omit<Settings, 'gemini_model' | 'gemini_api_key_set' | 'extractions_today' | 'extractions_total' | 'extract_daily_cap'>> & {
+  gemini_model?: string;
+  gemini_api_key?: string;
+};
 
 export interface Preview {
   again: number;
