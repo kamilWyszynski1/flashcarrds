@@ -1,6 +1,7 @@
 import { ApiError } from './api.errors';
 import type {
   Card,
+  ExtractOptions,
   ExtractResponse,
   Grade,
   Lesson,
@@ -77,8 +78,9 @@ export const httpApi: FiszkiApi = {
     request<StudyItem[]>('GET', `/study/queue${q(p)}`),
   review: (card_id: number, grade: Grade, direction: string) => request<ReviewResult>('POST', '/study/review', { card_id, grade, direction }),
 
-  extract: (images: { mime_type: string; data: string }[], hint: string, signal?: AbortSignal) =>
+  extract: (images: { mime_type: string; data: string }[], hint: string, signal?: AbortSignal, _opts?: ExtractOptions) =>
     request<ExtractResponse>('POST', '/extract', { images, hint }, signal),
+  probeModel: async () => ({ ok: false, latencyMs: 0, error: 'Probing is only supported in local mode' }),
 
   settings: () => request<Settings>('GET', '/settings'),
   patchSettings: (p: SettingsPatch) => request<Settings>('PATCH', '/settings', p),

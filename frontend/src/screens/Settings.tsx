@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Icon } from '../components/Icon';
 import { Button, Label, Toggle, TopBar } from '../components/ui';
 import { api, isLocalBackend } from '../lib/api';
+import { FREE_TIER_MODELS } from '../lib/gemini';
 import { useStore } from '../lib/store';
 import type { Theme } from '../lib/theme';
 import type { Settings as SettingsData, SettingsPatch } from '../lib/types';
@@ -235,10 +236,9 @@ export function Settings() {
                   list="gemini-models"
                 />
                 <datalist id="gemini-models">
-                  <option value="gemini-flash-latest" />
-                  <option value="gemini-flash-lite-latest" />
-                  <option value="gemini-2.5-pro" />
-                  <option value="gemini-2.0-flash" />
+                  {FREE_TIER_MODELS.map((m) => (
+                    <option key={m.id} value={m.id} label={m.label} />
+                  ))}
                 </datalist>
               </div>
             </Row>

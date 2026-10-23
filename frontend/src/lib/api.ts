@@ -3,6 +3,7 @@ import { httpApi } from './api.http';
 import { localApi } from './api.local';
 import type {
   Card,
+  ExtractOptions,
   ExtractResponse,
   Grade,
   Lesson,
@@ -16,6 +17,7 @@ import type {
   Unit,
 } from './types';
 
+export type { ExtractOptions };
 export { ApiError };
 
 export interface FiszkiApi {
@@ -41,7 +43,13 @@ export interface FiszkiApi {
   studyQueue: (p?: { scope?: string; mode?: string; ids?: string; limit?: number; direction?: string }) => Promise<StudyItem[]>;
   review: (card_id: number, grade: Grade, direction: string) => Promise<ReviewResult>;
 
-  extract: (images: { mime_type: string; data: string }[], hint: string, signal?: AbortSignal) => Promise<ExtractResponse>;
+  extract: (
+    images: { mime_type: string; data: string }[],
+    hint: string,
+    signal?: AbortSignal,
+    opts?: ExtractOptions,
+  ) => Promise<ExtractResponse>;
+  probeModel?: (model: string, signal?: AbortSignal, timeoutMs?: number) => Promise<{ ok: boolean; latencyMs: number; status?: number; error?: string }>;
 
   settings: () => Promise<Settings>;
   patchSettings: (p: SettingsPatch) => Promise<Settings>;

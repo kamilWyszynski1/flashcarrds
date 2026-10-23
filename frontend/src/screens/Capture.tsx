@@ -2,8 +2,9 @@ import { useEffect, useRef, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { Icon } from '../components/Icon';
 import { Button, Chip, ErrorBox, Footer, GroupSelector, Label, Spinner, TopBar, fieldClass } from '../components/ui';
-import { api } from '../lib/api';
+import { api, isLocalBackend } from '../lib/api';
 import { describeExtractError } from '../lib/extractError';
+import { FREE_TIER_MODELS, extractWithModelFallback, type FallbackProgress } from '../lib/gemini';
 import { fmtBytes, prepareImage, type PreparedImage } from '../lib/image';
 import { markCaptureFlowStart, useSheets } from '../lib/sheets';
 import { useStore, useTargetLesson } from '../lib/store';
@@ -26,7 +27,7 @@ export function Capture() {
   const navigate = useNavigate();
   const location = useLocation();
   const retry = Boolean((location.state as { retry?: boolean } | null)?.retry);
-  const { settings, setDraft, draft, toast } = useStore();
+  const { settings, setSettings, setDraft, draft, toast } = useStore();
   const { openPicker } = useSheets();
   const target = useTargetLesson();
   const [images, setImages] = useState<PreparedImage[]>(() => (retry ? lastImages : []));
@@ -34,9 +35,23 @@ export function Capture() {
   const [preparing, setPreparing] = useState(false);
   const [phase, setPhase] = useState<'idle' | 'uploading' | 'extracting'>('idle');
   const [error, setError] = useState<string | null>(null);
+
+  const currentModel = settings?.gemini_model ?? 'gemini-flash-latest';
+  const [selectedModel, setSelectedModel] = useState<string>(currentModel);
+  const [activeModel, setActiveModel] = useState<string>(currentModel);
+  const [probing, setProbing] = useState<string | null>(null);
+  const [fallbackStatus, setFallbackStatus] = useState<FallbackProgress | null>(null);
+
   const fileRef = useRef<HTMLInputElement>(null);
   const galleryRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    if (settings?.gemini_model) {
+      setSelectedModel(settings.gemini_model);
+      setActiveModel(settings.gemini_model);
+    }
+  }, [settings?.gemini_model]);
 
   // Remember the history position of this screen so that saving on Review can
   // unwind back to wherever the user came from (Home, a lesson, …). A retry
@@ -77,23 +92,72 @@ export function Capture() {
     });
   };
 
-  // The server gives Gemini ~30 s (one retry on a fast 503), so a request that
-  // is still pending after this long is stuck somewhere; stop spinning and say so.
-  const CLIENT_TIMEOUT_MS = 60_000;
+  const modelOptions = [
+    ...(!FREE_TIER_MODELS.some((m) => m.id === selectedModel)
+      ? [{ id: selectedModel, label: `${selectedModel} (custom)` }]
+      : []),
+    ...FREE_TIER_MODELS,
+  ];
 
-  const extract = async () => {
-    if (images.length === 0) return;
+  const handleModelChange = async (newModel: string) => {
+    setSelectedModel(newModel);
+    setActiveModel(newModel);
+    try {
+      const s = await api.patchSettings({ gemini_model: newModel });
+      setSettings(s);
+    } catch (e: any) {
+      toast(e.message);
+    }
+  };
+
+  const findResponsiveModel = async () => {
     if (!settings?.gemini_api_key_set) {
-      setError('The server has no Gemini API key – set GEMINI_API_KEY in its .env and restart it.');
+      setError(
+        isLocalBackend
+          ? 'Gemini API key is not configured – add your key in Settings.'
+          : 'The server has no Gemini API key – set GEMINI_API_KEY in its .env and restart it.'
+      );
       return;
     }
+    setError(null);
+    for (const m of FREE_TIER_MODELS) {
+      setProbing(m.label);
+      try {
+        const res = await api.probeModel?.(m.id);
+        if (res?.ok) {
+          await handleModelChange(m.id);
+          toast(`Switched to ${m.label} (${res.latencyMs} ms)`);
+          setProbing(null);
+          return;
+        }
+      } catch {}
+    }
+    setProbing(null);
+    toast('All free-tier models appear busy or unreachable right now');
+  };
+
+  const CLIENT_TIMEOUT_MS = 60_000;
+
+  const extract = async (overrideModel?: string) => {
+    if (images.length === 0) return;
+    if (!settings?.gemini_api_key_set) {
+      setError(
+        isLocalBackend
+          ? 'Gemini API key is not configured – add your key in Settings.'
+          : 'The server has no Gemini API key – set GEMINI_API_KEY in its .env and restart it.'
+      );
+      return;
+    }
+    const modelToUse = overrideModel ?? selectedModel;
+    setActiveModel(modelToUse);
+    setFallbackStatus(null);
     localStorage.setItem(HINT_KEY, hint);
     setError(null);
     setPhase('uploading');
     const ac = new AbortController();
     abortRef.current = ac;
     let timedOut = false;
-    const t = setTimeout(() => setPhase('extracting'), 900);
+    const t = setTimeout(() => setPhase('extracting'), 600);
     const guard = setTimeout(() => {
       timedOut = true;
       ac.abort();
@@ -104,8 +168,12 @@ export function Capture() {
         images.map((i) => ({ mime_type: i.mime_type, data: i.data })),
         hint,
         ac.signal,
+        { model: modelToUse }
       );
       lastImages = images;
+      if (res.model && res.model !== settings.gemini_model) {
+        void api.settings().then(setSettings);
+      }
       setDraft({
         source: 'photo',
         hint,
@@ -114,11 +182,10 @@ export function Capture() {
         cards: res.cards.map((c, i) => ({ ...c, include: !c.existing_in, key: i + 1 })),
       });
       if (res.cards.length === 0) toast('No vocabulary found – try a sharper photo or a different hint.');
-      // On retry this screen replaced the Review entry, so replace it back.
       navigate('/review', { replace: retry });
     } catch (e) {
       if ((e as Error).name === 'AbortError') {
-        if (timedOut) setError(`No answer from the server after ${Math.round((Date.now() - started) / 1000)} s – it may be overloaded. Try again in a minute.`);
+        if (timedOut) setError(`No answer from Gemini after ${Math.round((Date.now() - started) / 1000)} s – try another model or "Auto-try free models".`);
         return;
       }
       setError(describeExtractError(e));
@@ -130,23 +197,134 @@ export function Capture() {
     }
   };
 
+  const extractTryingModels = async () => {
+    if (images.length === 0) return;
+    if (!settings?.gemini_api_key_set) {
+      setError(
+        isLocalBackend
+          ? 'Gemini API key is not configured – add your key in Settings.'
+          : 'The server has no Gemini API key – set GEMINI_API_KEY in its .env and restart it.'
+      );
+      return;
+    }
+    localStorage.setItem(HINT_KEY, hint);
+    setError(null);
+    setPhase('uploading');
+    const ac = new AbortController();
+    abortRef.current = ac;
+    const t = setTimeout(() => setPhase('extracting'), 600);
+
+    const orderedModels = [
+      selectedModel,
+      ...FREE_TIER_MODELS.map((m) => m.id).filter((id) => id !== selectedModel),
+    ];
+
+    try {
+      const res = await extractWithModelFallback(
+        (imgs, h, sig, opts) => api.extract(imgs, h, sig, opts),
+        images.map((i) => ({ mime_type: i.mime_type, data: i.data })),
+        hint,
+        orderedModels,
+        ac.signal,
+        (progress) => {
+          setActiveModel(progress.currentModel);
+          setFallbackStatus(progress);
+        }
+      );
+      lastImages = images;
+      if (res.model) {
+        setSelectedModel(res.model);
+        void api.settings().then(setSettings);
+      }
+      setDraft({
+        source: 'photo',
+        hint,
+        model: res.model,
+        previewUrl: images[0]?.previewUrl,
+        cards: res.cards.map((c, i) => ({ ...c, include: !c.existing_in, key: i + 1 })),
+      });
+      toast(`Extracted with ${res.model}!`);
+      if (res.cards.length === 0) toast('No vocabulary found – try a sharper photo or a different hint.');
+      navigate('/review', { replace: retry });
+    } catch (e) {
+      if ((e as Error).name === 'AbortError') {
+        return;
+      }
+      setError(describeExtractError(e));
+    } finally {
+      clearTimeout(t);
+      setPhase('idle');
+      setFallbackStatus(null);
+      abortRef.current = null;
+    }
+  };
+
+  const switchModelWhileExtracting = (newModel: string) => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setSelectedModel(newModel);
+    setActiveModel(newModel);
+    void api.patchSettings({ gemini_model: newModel }).then(setSettings);
+    setTimeout(() => {
+      void extract(newModel);
+    }, 50);
+  };
+
   const cancel = () => {
     abortRef.current?.abort();
     setPhase('idle');
+    setFallbackStatus(null);
   };
 
   if (phase !== 'idle') {
+    const currentLabel = FREE_TIER_MODELS.find((m) => m.id === activeModel)?.label ?? activeModel;
     return (
-      <div className="min-h-dvh bg-surface flex flex-col items-center justify-center text-center px-6">
+      <div className="min-h-dvh bg-surface flex flex-col items-center justify-center text-center px-6 py-10 max-w-app mx-auto">
         <Spinner className="w-16 h-16 border-[5px] mb-6" />
         <h2 className="font-display text-headline-md text-on-surface">Reading the page…</h2>
-        <div className="text-body-sm text-on-surface-variant mt-1.5">Usually 3–8 seconds · gives up after about 30 s</div>
-        <div className="mt-6 flex flex-col gap-2.5 text-left text-body-md text-on-surface-variant">
-          <Step done>Photo compressed ({images.map((i) => `${fmtBytes(i.originalBytes)} → ${fmtBytes(i.bytes)}`).join(', ')})</Step>
-          <Step done={phase === 'extracting'}>Uploaded</Step>
-          <Step done={false}>Extracting vocabulary with {settings?.gemini_model ?? 'Gemini'}…</Step>
+        <div className="text-body-sm text-on-surface-variant mt-1.5">
+          {fallbackStatus
+            ? `Trying free models: ${fallbackStatus.attemptIndex + 1} of ${fallbackStatus.totalModels}`
+            : 'Usually 3–8 seconds · gives up after about 30 s'}
         </div>
-        <Button variant="outline" className="mt-9" onClick={cancel}>
+
+        <div className="mt-6 flex flex-col gap-2.5 text-left text-body-md text-on-surface-variant w-full max-w-xs">
+          <Step done>Photo ready ({images.map((i) => fmtBytes(i.bytes)).join(', ')})</Step>
+          <Step done={phase === 'extracting'}>Sending to API</Step>
+          <Step done={false}>
+            Trying <span className="font-semibold text-primary">{currentLabel}</span>…
+          </Step>
+        </div>
+
+        {fallbackStatus && fallbackStatus.tried.length > 0 && (
+          <div className="mt-4 p-3 bg-surface-container rounded-xl text-left text-body-sm text-on-surface-variant w-full max-w-xs space-y-1">
+            <div className="font-semibold text-label-sm uppercase text-on-surface-variant mb-1">Attempt history</div>
+            {fallbackStatus.tried.map((t) => (
+              <div key={t.model} className="flex items-center gap-1.5 truncate">
+                <span className="text-error font-bold">✗</span>
+                <span className="font-mono text-xs truncate">{t.model}</span>
+                <span className="text-xs text-outline shrink-0">(busy)</span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className="mt-6 w-full max-w-xs flex flex-col items-center gap-2">
+          <div className="text-label-sm text-on-surface-variant">Model taking too long? Switch & retry:</div>
+          <select
+            className="w-full bg-surface-container rounded-full px-4 h-10 text-label-md text-on-surface outline-none border border-outline-variant/60"
+            value={activeModel}
+            onChange={(e) => switchModelWhileExtracting(e.target.value)}
+          >
+            {modelOptions.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.label}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <Button variant="outline" className="mt-6" onClick={cancel}>
           Cancel
         </Button>
       </div>
@@ -240,15 +418,68 @@ export function Capture() {
         <GroupSelector unit={target?.unit.name} lesson={target?.lesson.name} onClick={() => openPicker()} />
         <div className="text-body-sm text-on-surface-variant mt-2">You can still change the group on the review screen.</div>
 
+        <Label>Gemini model</Label>
+        <div className="flex items-center gap-2">
+          <select
+            className="flex-1 min-w-0 bg-surface-container-low rounded-xl px-3.5 h-[52px] text-body-md font-semibold text-on-surface outline-none border-2 border-transparent focus:border-primary"
+            value={selectedModel}
+            onChange={(e) => void handleModelChange(e.target.value)}
+          >
+            {modelOptions.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.label}
+              </option>
+            ))}
+          </select>
+          {isLocalBackend && (
+            <Button
+              variant="tonal"
+              size="sm"
+              className="h-[52px] px-3.5 whitespace-nowrap text-label-md shrink-0"
+              onClick={() => void findResponsiveModel()}
+              disabled={probing !== null}
+            >
+              {probing ? (
+                <>
+                  <Spinner className="w-4 h-4 border-2" />
+                  <span className="text-xs">Checking…</span>
+                </>
+              ) : (
+                <>
+                  <Icon name="sparkle" size={16} />
+                  <span>Find not-busy</span>
+                </>
+              )}
+            </Button>
+          )}
+        </div>
+        {probing && (
+          <div className="text-body-sm text-primary mt-1 px-1">
+            Probing {probing}…
+          </div>
+        )}
+
         {!settings?.gemini_api_key_set && settings && (
           <div className="mt-4 rounded-xl bg-secondary-fixed/60 text-on-secondary-fixed p-3.5 text-body-sm flex gap-3 items-start">
             <Icon name="key" size={20} />
             <div>
-              The server has no Gemini API key, so photo extraction is off. Add <code>GEMINI_API_KEY</code> to the server’s <code>.env</code> and restart it (status in{' '}
-              <button type="button" className="font-semibold underline" onClick={() => navigate('/settings')}>
-                Settings
-              </button>
-              ).
+              {isLocalBackend ? (
+                <>
+                  No Gemini API key configured on this device. Paste your key in{' '}
+                  <button type="button" className="font-semibold underline" onClick={() => navigate('/settings')}>
+                    Settings
+                  </button>{' '}
+                  to enable photo extraction.
+                </>
+              ) : (
+                <>
+                  The server has no Gemini API key, so photo extraction is off. Add <code>GEMINI_API_KEY</code> to the server’s <code>.env</code> and restart it (status in{' '}
+                  <button type="button" className="font-semibold underline" onClick={() => navigate('/settings')}>
+                    Settings
+                  </button>
+                  ).
+                </>
+              )}
             </div>
           </div>
         )}
@@ -259,8 +490,17 @@ export function Capture() {
         )}
       </main>
       <Footer>
-        <Button className="flex-1" icon="sparkle" disabled={images.length === 0 || preparing || !target} onClick={() => void extract()}>
+        <Button className="flex-1 min-w-0" icon="sparkle" disabled={images.length === 0 || preparing || !target} onClick={() => void extract()}>
           Extract cards
+        </Button>
+        <Button
+          variant="tonal"
+          className="shrink-0"
+          disabled={images.length === 0 || preparing || !target}
+          onClick={() => void extractTryingModels()}
+          title="Try free-tier Gemini models one by one until one responds"
+        >
+          Auto-try free models
         </Button>
       </Footer>
     </div>

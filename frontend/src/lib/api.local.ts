@@ -5,6 +5,7 @@ import {
   RateLimiter,
   cleanModel,
   extractFromGemini,
+  probeGeminiModel,
   validateImages,
   MAX_HINT_CHARS,
 } from './gemini';
@@ -29,6 +30,7 @@ import type {
   Card,
   Counts,
   ExtractedCard,
+  ExtractOptions,
   ExtractResponse,
   Lesson,
   LessonDetail,
@@ -793,7 +795,12 @@ export const localApi: FiszkiApi = {
     };
   },
 
-  async extract(images: { mime_type: string; data: string }[], hint: string, signal?: AbortSignal): Promise<ExtractResponse> {
+  async extract(
+    images: { mime_type: string; data: string }[],
+    hint: string,
+    signal?: AbortSignal,
+    opts?: ExtractOptions,
+  ): Promise<ExtractResponse> {
     try {
       validateImages(images);
     } catch (e: any) {
@@ -814,12 +821,21 @@ export const localApi: FiszkiApi = {
       throw new ApiError(400, 'no_api_key', 'Gemini API key is not configured – add your key in Settings');
     }
 
-    const rawModel = map.get('gemini_model') ?? DEFAULT_SETTINGS.gemini_model;
     let model: string;
-    try {
-      model = cleanModel(rawModel);
-    } catch (e: any) {
-      throw new ApiError(400, 'validation', e.message);
+    if (opts?.model) {
+      try {
+        model = cleanModel(opts.model);
+        await setSettingValue('gemini_model', model);
+      } catch (e: any) {
+        throw new ApiError(400, 'validation', e.message);
+      }
+    } else {
+      const rawModel = map.get('gemini_model') ?? DEFAULT_SETTINGS.gemini_model;
+      try {
+        model = cleanModel(rawModel);
+      } catch (e: any) {
+        throw new ApiError(400, 'validation', e.message);
+      }
     }
 
     const capStr = map.get('extract_daily_cap') ?? map.get('gemini_daily_limit') ?? DEFAULT_SETTINGS.gemini_daily_limit;
@@ -830,12 +846,14 @@ export const localApi: FiszkiApi = {
       throw new ApiError(429, 'rate_limit', `Daily extraction limit reached (${cap}/day) – try again tomorrow`);
     }
 
-    const rpmStr = map.get('gemini_rpm_limit') ?? DEFAULT_SETTINGS.gemini_rpm_limit;
-    const rpm = parseInt(rpmStr, 10) || 6;
-    rateLimiter.setMax(rpm);
-    const limiterCheck = rateLimiter.check();
-    if (!limiterCheck.ok) {
-      throw new ApiError(429, 'rate_limit', `Too many extractions in a row – wait ${limiterCheck.waitSecs}s and try again`);
+    if (!opts?.skipRateLimit) {
+      const rpmStr = map.get('gemini_rpm_limit') ?? DEFAULT_SETTINGS.gemini_rpm_limit;
+      const rpm = parseInt(rpmStr, 10) || 6;
+      rateLimiter.setMax(rpm);
+      const limiterCheck = rateLimiter.check();
+      if (!limiterCheck.ok) {
+        throw new ApiError(429, 'rate_limit', `Too many extractions in a row – wait ${limiterCheck.waitSecs}s and try again`);
+      }
     }
 
     await recordExtraction(now);
@@ -853,6 +871,7 @@ export const localApi: FiszkiApi = {
         frontLang,
         backLang,
         signal,
+        timeoutMs: opts?.timeoutMs,
       });
     } catch (e: any) {
       if (e?.name === 'AbortError' || signal?.aborted) {
@@ -894,6 +913,13 @@ export const localApi: FiszkiApi = {
       model,
       hint: truncatedHint,
     };
+  },
+
+  async probeModel(model: string, signal?: AbortSignal, timeoutMs?: number) {
+    const settingsRows = await db.settings.toArray();
+    const map = new Map(settingsRows.map((s) => [s.key, s.value]));
+    const apiKey = (map.get('gemini_api_key') ?? '').trim();
+    return probeGeminiModel({ apiKey, model, signal, timeoutMs });
   },
 
   async settings(): Promise<Settings> {

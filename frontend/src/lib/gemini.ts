@@ -1,4 +1,21 @@
-import type { ExtractedCard } from './types';
+import type { ExtractedCard, ExtractOptions, ExtractResponse } from './types';
+
+export interface FreeTierModelInfo {
+  id: string;
+  label: string;
+}
+
+export const FREE_TIER_MODELS: FreeTierModelInfo[] = [
+  { id: 'gemini-flash-latest', label: 'Gemini Flash Latest' },
+  { id: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash' },
+  { id: 'gemini-3-flash-preview', label: 'Gemini 3 Flash Preview' },
+  { id: 'gemini-3.5-flash-lite', label: 'Gemini 3.5 Flash-Lite (fast)' },
+  { id: 'gemini-3.1-flash-lite', label: 'Gemini 3.1 Flash-Lite (fast)' },
+  { id: 'gemini-2.5-flash-lite', label: 'Gemini 2.5 Flash-Lite (fast)' },
+  { id: 'gemini-flash-lite-latest', label: 'Gemini Flash-Lite Latest (fast)' },
+  { id: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash' },
+  { id: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash' },
+];
 
 export const DEFAULT_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta';
 export const DEFAULT_MODEL = 'gemini-flash-latest';
@@ -369,4 +386,162 @@ export async function extractFromGemini(opts: {
       throw new Error(formatContext('parse', model, opts.images, opts.hint, totalElapsed, inner));
     }
   }
+}
+
+export interface ProbeModelOptions {
+  apiKey: string;
+  model: string;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  baseUrl?: string;
+  fetchImpl?: typeof fetch;
+}
+
+export interface ProbeModelResult {
+  ok: boolean;
+  latencyMs: number;
+  status?: number;
+  error?: string;
+}
+
+export async function probeGeminiModel(opts: ProbeModelOptions): Promise<ProbeModelResult> {
+  const apiKey = (opts.apiKey || '').trim();
+  if (!apiKey) {
+    return { ok: false, latencyMs: 0, error: 'Gemini API key is not configured' };
+  }
+
+  let model: string;
+  try {
+    model = cleanModel(opts.model);
+  } catch (e: any) {
+    return { ok: false, latencyMs: 0, error: e.message };
+  }
+
+  const baseUrl = (opts.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, '');
+  const timeoutMs = opts.timeoutMs ?? 6000;
+  const fetchFn = opts.fetchImpl ?? (typeof window !== 'undefined' ? window.fetch.bind(window) : fetch);
+
+  const url = `${baseUrl}/models/${model}:generateContent`;
+  const body = JSON.stringify({
+    contents: [{ role: 'user', parts: [{ text: 'ok' }] }],
+    generationConfig: { maxOutputTokens: 4 },
+  });
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => {
+    controller.abort(new DOMException('Probe timed out', 'TimeoutError'));
+  }, timeoutMs);
+
+  const onCallerAbort = () => {
+    controller.abort(opts.signal?.reason || new DOMException('The user aborted a request.', 'AbortError'));
+  };
+  opts.signal?.addEventListener('abort', onCallerAbort);
+
+  const started = Date.now();
+  try {
+    const resp = await fetchFn(url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-goog-api-key': apiKey,
+      },
+      body,
+      signal: controller.signal,
+    });
+    const latencyMs = Date.now() - started;
+    if (resp.ok) {
+      return { ok: true, latencyMs, status: resp.status };
+    }
+    const text = await resp.text().catch(() => '');
+    const { apiStatus, message } = parseErrorBody(text);
+    const statusPart = apiStatus ? ` ${apiStatus}` : '';
+    const msg = message || truncateBody(text.trim(), 200) || `HTTP ${resp.status}`;
+    return { ok: false, latencyMs, status: resp.status, error: `HTTP ${resp.status}${statusPart}: ${msg}` };
+  } catch (e: any) {
+    const latencyMs = Date.now() - started;
+    if (opts.signal?.aborted) {
+      throw new DOMException('The user aborted a request.', 'AbortError');
+    }
+    const isTimeout = e?.name === 'TimeoutError' || (e?.name === 'AbortError' && !opts.signal?.aborted);
+    const errText = isTimeout ? 'Timed out' : (e?.message || 'Network error');
+    return { ok: false, latencyMs, error: errText };
+  } finally {
+    clearTimeout(timeoutId);
+    opts.signal?.removeEventListener('abort', onCallerAbort);
+  }
+}
+
+export interface FallbackProgress {
+  currentModel: string;
+  attemptIndex: number;
+  totalModels: number;
+  tried: { model: string; error: string }[];
+}
+
+export async function extractWithModelFallback(
+  extractFn: (
+    images: { mime_type: string; data: string }[],
+    hint: string,
+    signal?: AbortSignal,
+    opts?: ExtractOptions,
+  ) => Promise<ExtractResponse>,
+  images: { mime_type: string; data: string }[],
+  hint: string,
+  candidateModels: string[],
+  signal?: AbortSignal,
+  onProgress?: (progress: FallbackProgress) => void,
+): Promise<ExtractResponse> {
+  if (candidateModels.length === 0) {
+    throw new Error('No models specified for extraction');
+  }
+
+  const tried: { model: string; error: string }[] = [];
+  const totalModels = candidateModels.length;
+
+  for (let i = 0; i < candidateModels.length; i++) {
+    const currentModel = candidateModels[i];
+    if (signal?.aborted) {
+      throw new DOMException('The user aborted a request.', 'AbortError');
+    }
+
+    onProgress?.({
+      currentModel,
+      attemptIndex: i,
+      totalModels,
+      tried: [...tried],
+    });
+
+    try {
+      const res = await extractFn(images, hint, signal, {
+        model: currentModel,
+        timeoutMs: 12_000,
+        skipRateLimit: i > 0,
+      });
+      return res;
+    } catch (e: any) {
+      if (e?.name === 'AbortError' || signal?.aborted) {
+        throw e;
+      }
+      const msg = (e?.message || '').toLowerCase();
+      const isAuthOrConfigError =
+        (e?.status === 400 && (e?.code === 'no_api_key' || msg.includes('api key'))) ||
+        (e?.status === 403 && (e?.code === 'paused' || msg.includes('paused'))) ||
+        msg.includes('api_key_invalid') ||
+        msg.includes('api key not valid');
+
+      if (isAuthOrConfigError) {
+        throw e;
+      }
+
+      const shortErr = (e?.message || 'failed').slice(0, 150);
+      tried.push({ model: currentModel, error: shortErr });
+
+      if (i === candidateModels.length - 1) {
+        const errorSummary = tried.map((t) => `${t.model}: ${t.error}`).join('; ');
+        throw new Error(`All ${totalModels} free-tier models failed (${errorSummary})`);
+      }
+    }
+  }
+
+  throw new Error('All models exhausted');
 }

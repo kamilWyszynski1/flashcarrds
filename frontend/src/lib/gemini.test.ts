@@ -6,9 +6,12 @@ import {
   cleanModel,
   DEFAULT_MODEL,
   extractFromGemini,
+  extractWithModelFallback,
+  FREE_TIER_MODELS,
   MAX_IMAGE_B64_BYTES,
   parseErrorBody,
   parseResponse,
+  probeGeminiModel,
   RateLimiter,
   truncateBody,
   validateImages,
@@ -277,4 +280,146 @@ describe('gemini', () => {
       })
     ).rejects.toThrow();
   });
+
+  it('FREE_TIER_MODELS list is valid and cleanModel passes for all entries', () => {
+    expect(FREE_TIER_MODELS.length).toBeGreaterThanOrEqual(5);
+    for (const m of FREE_TIER_MODELS) {
+      expect(m.id).toBeTruthy();
+      expect(m.label).toBeTruthy();
+      expect(() => cleanModel(m.id)).not.toThrow();
+    }
+  });
+
+  describe('probeGeminiModel', () => {
+    it('returns error when API key is missing or model name is invalid', async () => {
+      const res1 = await probeGeminiModel({ apiKey: '', model: 'gemini-flash-latest' });
+      expect(res1.ok).toBe(false);
+      expect(res1.error).toContain('API key is not configured');
+
+      const res2 = await probeGeminiModel({ apiKey: 'k', model: 'bad name with spaces' });
+      expect(res2.ok).toBe(false);
+      expect(res2.error).toContain('model name may only contain');
+    });
+
+    it('returns ok on 200 response', async () => {
+      const fakeFetch: typeof fetch = async () =>
+        new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: 'ok' }] } }] }), {
+          status: 200,
+        });
+
+      const res = await probeGeminiModel({
+        apiKey: 'valid-key',
+        model: 'gemini-flash-latest',
+        fetchImpl: fakeFetch,
+      });
+      expect(res.ok).toBe(true);
+      expect(res.status).toBe(200);
+      expect(res.latencyMs).toBeGreaterThanOrEqual(0);
+    });
+
+    it('returns failure details on 503 response', async () => {
+      const fakeFetch: typeof fetch = async () =>
+        new Response(
+          JSON.stringify({
+            error: { code: 503, message: 'Model is currently overloaded.', status: 'UNAVAILABLE' },
+          }),
+          { status: 503 }
+        );
+
+      const res = await probeGeminiModel({
+        apiKey: 'valid-key',
+        model: 'gemini-flash-latest',
+        fetchImpl: fakeFetch,
+      });
+      expect(res.ok).toBe(false);
+      expect(res.status).toBe(503);
+      expect(res.error).toContain('503');
+      expect(res.error).toContain('UNAVAILABLE');
+    });
+  });
+
+  describe('extractWithModelFallback', () => {
+    const dummyImages = [{ mime_type: 'image/jpeg', data: 'abc' }];
+
+    it('throws error when candidateModels is empty', async () => {
+      await expect(
+        extractWithModelFallback(async () => ({ cards: [], model: 'm', hint: '' }), dummyImages, '', [])
+      ).rejects.toThrow('No models specified');
+    });
+
+    it('falls back to second model when first model fails with 503', async () => {
+      const progressUpdates: any[] = [];
+      const fakeExtract = async (_imgs: any, _hint: any, _sig: any, opts: any) => {
+        if (opts?.model === 'model-1') {
+          const err: any = new Error('503 Service Unavailable: overloaded');
+          err.status = 503;
+          throw err;
+        }
+        return {
+          cards: [
+            {
+              front: 'vino',
+              back: 'wino',
+              example: null,
+              existing_in: null,
+              existing_card_id: null,
+              confidence: 1,
+            },
+          ],
+          model: opts?.model || 'model-2',
+          hint: '',
+        };
+      };
+
+      const result = await extractWithModelFallback(
+        fakeExtract,
+        dummyImages,
+        'hint text',
+        ['model-1', 'model-2'],
+        undefined,
+        (p) => progressUpdates.push(p)
+      );
+
+      expect(result.cards.length).toBe(1);
+      expect(result.cards[0].front).toBe('vino');
+      expect(progressUpdates.length).toBe(2);
+      expect(progressUpdates[0].currentModel).toBe('model-1');
+      expect(progressUpdates[0].tried.length).toBe(0);
+      expect(progressUpdates[1].currentModel).toBe('model-2');
+      expect(progressUpdates[1].tried.length).toBe(1);
+      expect(progressUpdates[1].tried[0].model).toBe('model-1');
+    });
+
+    it('stops immediately without fallback on auth error', async () => {
+      let callCount = 0;
+      const fakeExtract = async () => {
+        callCount++;
+        const err: any = new Error('API key not valid. Please pass a valid API key.');
+        err.status = 400;
+        err.code = 'no_api_key';
+        throw err;
+      };
+
+      await expect(
+        extractWithModelFallback(fakeExtract, dummyImages, '', ['model-1', 'model-2'])
+      ).rejects.toThrow(/API key/);
+      expect(callCount).toBe(1); // Never tried model-2
+    });
+
+    it('aborts when signal is already cancelled', async () => {
+      const controller = new AbortController();
+      controller.abort();
+
+      await expect(
+        extractWithModelFallback(
+          async () => ({ cards: [], model: 'm', hint: '' }),
+          dummyImages,
+          '',
+          ['model-1'],
+          controller.signal
+        )
+      ).rejects.toThrow();
+    });
+  });
 });
+

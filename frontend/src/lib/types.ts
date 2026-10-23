@@ -142,6 +142,12 @@ export interface ExtractResponse {
   hint: string;
 }
 
+export interface ExtractOptions {
+  model?: string;
+  timeoutMs?: number;
+  skipRateLimit?: boolean;
+}
+
 export interface NewCard {
   front: string;
   back: string;

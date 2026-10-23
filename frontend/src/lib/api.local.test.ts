@@ -458,5 +458,70 @@ describe('localApi (IndexedDB)', () => {
         globalThis.fetch = originalFetch;
       }
     });
+
+    it('extract supports model override and persists winning model to settings', async () => {
+      await localApi.patchSettings({ gemini_api_key: 'test-key', gemini_model: 'gemini-flash-latest' });
+
+      let capturedUrl = '';
+      const fakeResponse = {
+        candidates: [
+          {
+            content: {
+              parts: [{ text: JSON.stringify([{ front: 'luna', back: 'księżyc' }]) }],
+            },
+          },
+        ],
+      };
+
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = async (input: RequestInfo | URL) => {
+        capturedUrl = String(input);
+        return new Response(JSON.stringify(fakeResponse), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      };
+
+      try {
+        const result = await localApi.extract(
+          [{ mime_type: 'image/jpeg', data: 'dGVzdA==' }],
+          '',
+          undefined,
+          { model: 'gemini-3.6-flash', skipRateLimit: true }
+        );
+
+        expect(result.cards.length).toBe(1);
+        expect(result.cards[0].front).toBe('luna');
+        expect(capturedUrl).toContain('models/gemini-3.6-flash:generateContent');
+
+        // Check model was saved to settings
+        const settings = await localApi.settings();
+        expect(settings.gemini_model).toBe('gemini-3.6-flash');
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+
+    it('probeModel tests model responsiveness with configured key', async () => {
+      await localApi.patchSettings({ gemini_api_key: 'test-key' });
+
+      let capturedUrl = '';
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = async (input: RequestInfo | URL) => {
+        capturedUrl = String(input);
+        return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: 'ok' }] } }] }), {
+          status: 200,
+        });
+      };
+
+      try {
+        const probeRes = await localApi.probeModel?.('gemini-3.5-flash-lite');
+        expect(probeRes?.ok).toBe(true);
+        expect(probeRes?.status).toBe(200);
+        expect(capturedUrl).toContain('models/gemini-3.5-flash-lite:generateContent');
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
   });
 });
