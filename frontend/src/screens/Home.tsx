@@ -21,7 +21,7 @@ export function Home() {
   return (
     <div className="min-h-dvh bg-surface pb-48">
       <TopBar
-        leading={<img src="/icons/icon.svg" alt="" aria-hidden="true" className="h-8 w-8 rounded-lg" />}
+        leading={<img src={`${import.meta.env.BASE_URL}icons/icon.svg`} alt="" aria-hidden="true" className="h-8 w-8 rounded-lg" />}
         title={
           <span className="flex items-center gap-1.5">
             Fiszki <span className="text-outline-variant font-normal">•</span> <span className="text-label-md text-on-surface-variant font-medium">Groups</span>
