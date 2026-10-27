@@ -1,5 +1,7 @@
 import { ApiError } from './api.errors';
 import type {
+  AiEditResponse,
+  BulkCardUpdate,
   Card,
   ExtractOptions,
   ExtractResponse,
@@ -72,6 +74,7 @@ export const httpApi: FiszkiApi = {
     request<{ created: number; ids: number[]; lesson: Lesson }>('POST', '/cards/bulk', { lesson_id, cards }),
   updateCard: (id: number, patch: { front?: string; back?: string; example?: string; lesson_id?: number; reset_progress?: boolean }) =>
     request<Card>('PATCH', `/cards/${id}`, patch),
+  updateCardsBulk: (updates: BulkCardUpdate[]) => request<{ updated: number }>('POST', '/cards/bulk-patch', { updates }),
   deleteCard: (id: number) => request<void>('DELETE', `/cards/${id}`),
 
   studyQueue: (p: { scope?: string; mode?: string; ids?: string; limit?: number; direction?: string } = {}) =>
@@ -80,6 +83,10 @@ export const httpApi: FiszkiApi = {
 
   extract: (images: { mime_type: string; data: string }[], hint: string, signal?: AbortSignal, _opts?: ExtractOptions) =>
     request<ExtractResponse>('POST', '/extract', { images, hint }, signal),
+  generate: (prompt: string, signal?: AbortSignal, _opts?: ExtractOptions) =>
+    request<ExtractResponse>('POST', '/generate', { prompt }, signal),
+  aiEditCards: (cardIds: number[], prompt: string, signal?: AbortSignal, _opts?: ExtractOptions) =>
+    request<AiEditResponse>('POST', '/cards/ai-edit', { card_ids: cardIds, prompt }, signal),
   probeModel: async () => ({ ok: false, latencyMs: 0, error: 'Probing is only supported in local mode' }),
 
   settings: () => request<Settings>('GET', '/settings'),

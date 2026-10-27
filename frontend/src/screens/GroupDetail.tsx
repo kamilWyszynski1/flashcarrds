@@ -118,11 +118,14 @@ export function GroupDetail() {
             title="This lesson is empty"
             text="Photograph the vocabulary box of this lesson, or type the first card."
             action={
-              <div className="flex gap-2">
+              <div className="flex flex-wrap justify-center gap-2">
                 <Button icon="camera" onClick={() => navigate('/capture')}>
                   From photo
                 </Button>
-                <Button variant="tonal" icon="edit" onClick={() => { setEditingCard(null); openSheet('card'); }}>
+                <Button variant="tonal" icon="sparkle" onClick={() => navigate('/prompt')}>
+                  From prompt
+                </Button>
+                <Button variant="outline" icon="edit" onClick={() => { setEditingCard(null); openSheet('card'); }}>
                   Type
                 </Button>
               </div>
@@ -177,11 +180,23 @@ export function GroupDetail() {
 
       {detail.total > 0 && (
         <Footer>
-          <Button variant="tonal" className="px-4" icon="plus" onClick={() => openSheet('addsource')}>
+          <Button variant="tonal" className="px-3.5 shrink-0" icon="plus" onClick={() => openSheet('addsource')}>
             Add
           </Button>
           <Button
-            className="flex-1"
+            variant="tonal"
+            className="px-3.5 shrink-0"
+            icon="edit"
+            onClick={() =>
+              navigate(`/edit-cards?lesson=${detail.id}`, {
+                state: cards.length > 0 && cards.length < detail.cards.length ? { filteredIds: cards.map((c) => c.id) } : undefined,
+              })
+            }
+          >
+            Edit
+          </Button>
+          <Button
+            className="flex-1 min-w-0 px-4"
             icon="play"
             onClick={() => {
               if (todo > 0) navigate(`/study?scope=lesson:${detail.id}`);
@@ -191,7 +206,7 @@ export function GroupDetail() {
               }
             }}
           >
-            {todo > 0 ? `Study ${todo} due & new` : 'Practise all'}
+            <span className="truncate">{todo > 0 ? `Study ${todo} due & new` : 'Practise all'}</span>
           </Button>
         </Footer>
       )}

@@ -115,6 +115,67 @@ describe('localApi (IndexedDB)', () => {
     expect(settings.last_lesson_id).toBe(lesson.id);
   });
 
+  it('updateCardsBulk validates input, updates content, and preserves SRS schedule', async () => {
+    const unit = await localApi.createUnit('Unidad 2.5');
+    const lesson = await localApi.createLesson(unit.id, '2.5 SRS');
+
+    const created = await localApi.createCard(lesson.id, {
+      front: 'el café',
+      back: 'kawa',
+      example: 'Café caliente',
+    });
+
+    // Review card to move it out of 'new' state and set SRS fields
+    const reviewed = await localApi.review(created.id, 'good', 'forward');
+    expect(reviewed.card.status).toBe('learned');
+    expect(reviewed.card.reps).toBe(1);
+
+    // Validation errors
+    await expect(localApi.updateCardsBulk([])).rejects.toThrow('no updates to apply');
+    await expect(localApi.updateCardsBulk([{ id: created.id, front: '', back: 'kawa' }])).rejects.toThrow(
+      'front and back are required'
+    );
+    await expect(localApi.updateCardsBulk([{ id: created.id, front: 'el café', back: '' }])).rejects.toThrow(
+      'front and back are required'
+    );
+    await expect(
+      localApi.updateCardsBulk(
+        Array.from({ length: 501 }, (_, i) => ({ id: i + 1, front: 'f', back: 'b' }))
+      )
+    ).rejects.toThrow('too many updates');
+
+    // Successfully apply bulk update, including a non-existent card ID
+    const res = await localApi.updateCardsBulk([
+      {
+        id: created.id,
+        front: 'el café solo',
+        back: 'czarna kawa',
+        example: 'Un café solo, por favor',
+      },
+      {
+        id: 999999, // non-existent card
+        front: 'fantasma',
+        back: 'duch',
+      },
+    ]);
+
+    expect(res.updated).toBe(1);
+
+    // Verify card content was updated but SRS state was strictly preserved
+    const cards = await localApi.cards({ lesson_id: lesson.id });
+    expect(cards.length).toBe(1);
+    const updatedCard = cards[0];
+    expect(updatedCard.front).toBe('el café solo');
+    expect(updatedCard.back).toBe('czarna kawa');
+    expect(updatedCard.example).toBe('Un café solo, por favor');
+    expect(updatedCard.status).toBe('learned');
+    expect(updatedCard.reps).toBe(1);
+    expect(updatedCard.lapses).toBe(reviewed.card.lapses);
+    expect(updatedCard.interval_label).toBe(reviewed.card.interval_label);
+    expect(updatedCard.due).toBe(reviewed.card.due);
+    expect(updatedCard.interval_days).toBe(reviewed.card.interval_days);
+  });
+
   it('cards search and status filters', async () => {
     const unit = await localApi.createUnit('Unidad 3');
     const lesson = await localApi.createLesson(unit.id, '3.1 Viajar');
@@ -519,6 +580,213 @@ describe('localApi (IndexedDB)', () => {
         expect(probeRes?.ok).toBe(true);
         expect(probeRes?.status).toBe(200);
         expect(capturedUrl).toContain('models/gemini-3.5-flash-lite:generateContent');
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+  });
+
+  describe('generate (Gemini prompt integration)', () => {
+    it('requires Gemini API key', async () => {
+      await expect(localApi.generate('Vocabulario de frutas')).rejects.toThrow(
+        'Gemini API key is not configured'
+      );
+    });
+
+    it('validates prompt input', async () => {
+      await localApi.patchSettings({ gemini_api_key: 'test-key' });
+      await expect(localApi.generate('   ')).rejects.toThrow('prompt cannot be empty');
+    });
+
+    it('enforces extraction pause killswitch', async () => {
+      await localApi.patchSettings({ gemini_api_key: 'test-key', extraction_paused: true });
+      await expect(localApi.generate('frutas')).rejects.toThrow(
+        'Extraction is paused'
+      );
+    });
+
+    it('enforces daily cap limit', async () => {
+      await localApi.patchSettings({
+        gemini_api_key: 'test-key',
+        extraction_paused: false,
+        extract_daily_cap: 1,
+      });
+
+      const fakeResponse = {
+        candidates: [
+          {
+            content: {
+              parts: [{ text: JSON.stringify([{ front: 'el té', back: 'herbata' }]) }],
+            },
+          },
+        ],
+      };
+
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = async () =>
+        new Response(JSON.stringify(fakeResponse), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+
+      try {
+        const res1 = await localApi.generate('bebidas');
+        expect(res1.cards.length).toBe(1);
+
+        await expect(localApi.generate('bebidas')).rejects.toThrow(
+          'Daily extraction limit reached'
+        );
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+
+    it('generates cards, detects duplicates against existing lessons, and records usage', async () => {
+      const unit = await localApi.createUnit('Unidad 10');
+      const lesson = await localApi.createLesson(unit.id, '10.1 Frutas');
+      const existingCard = await localApi.createCard(lesson.id, {
+        front: 'la manzana',
+        back: 'jabłko',
+      });
+
+      await localApi.patchSettings({ gemini_api_key: 'test-key', extract_daily_cap: 50 });
+
+      const fakeResponse = {
+        candidates: [
+          {
+            content: {
+              parts: [
+                {
+                  text: JSON.stringify([
+                    { front: 'la manzana', back: 'jabłko' },
+                    { front: 'el plátano', back: 'banan', example: 'Un plátano amarillo.' },
+                  ]),
+                },
+              ],
+            },
+          },
+        ],
+      };
+
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = async () =>
+        new Response(JSON.stringify(fakeResponse), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+
+      try {
+        const res = await localApi.generate('frutas tropicales');
+        expect(res.cards.length).toBe(2);
+
+        // First card is recognized as duplicate
+        expect(res.cards[0].front).toBe('la manzana');
+        expect(res.cards[0].existing_in).toBe('10.1 Frutas');
+        expect(res.cards[0].existing_card_id).toBe(existingCard.id);
+
+        // Second card is new
+        expect(res.cards[1].front).toBe('el plátano');
+        expect(res.cards[1].existing_in).toBeNull();
+        expect(res.cards[1].example).toBe('Un plátano amarillo.');
+
+        // Usage is recorded in settings
+        const settings = await localApi.settings();
+        expect(settings.extractions_today).toBe(1);
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+  });
+
+  describe('aiEditCards (batch editing with Gemini)', () => {
+    it('validates prompt and card selection', async () => {
+      await localApi.patchSettings({ gemini_api_key: 'test-key' });
+
+      await expect(localApi.aiEditCards([1], '   ')).rejects.toThrow('prompt cannot be empty');
+      await expect(localApi.aiEditCards([], 'add examples')).rejects.toThrow('no cards selected');
+      await expect(
+        localApi.aiEditCards(
+          Array.from({ length: 201 }, (_, i) => i + 1),
+          'add examples'
+        )
+      ).rejects.toThrow('too many cards (max 200)');
+      await expect(localApi.aiEditCards([999999], 'add examples')).rejects.toThrow(
+        'no valid cards found'
+      );
+    });
+
+    it('filters out unchanged cards and computes diffs', async () => {
+      const unit = await localApi.createUnit('Unidad 11');
+      const lesson = await localApi.createLesson(unit.id, '11.1 Edits');
+
+      const cardA = await localApi.createCard(lesson.id, {
+        front: 'coche',
+        back: 'auto',
+      });
+      const cardB = await localApi.createCard(lesson.id, {
+        front: 'casa',
+        back: 'dom',
+      });
+
+      await localApi.patchSettings({ gemini_api_key: 'test-key', extract_daily_cap: 50 });
+
+      // Gemini returns Card A modified, but Card B identical to original
+      const fakeResponse = {
+        candidates: [
+          {
+            content: {
+              parts: [
+                {
+                  text: JSON.stringify([
+                    {
+                      id: cardA.id,
+                      front: 'el coche',
+                      back: 'samochód',
+                      example: 'El coche azul.',
+                    },
+                    {
+                      id: cardB.id,
+                      front: 'casa',
+                      back: 'dom',
+                    },
+                  ]),
+                },
+              ],
+            },
+          },
+        ],
+      };
+
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = async () =>
+        new Response(JSON.stringify(fakeResponse), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+
+      try {
+        const res = await localApi.aiEditCards(
+          [cardA.id, cardB.id],
+          'Add definite articles and an example sentence'
+        );
+
+        expect(res.inspected).toBe(2);
+        // Only cardA was changed, cardB was filtered out
+        expect(res.edits.length).toBe(1);
+
+        const edit = res.edits[0];
+        expect(edit.card_id).toBe(cardA.id);
+        expect(edit.front).toBe('el coche');
+        expect(edit.orig_front).toBe('coche');
+        expect(edit.back).toBe('samochód');
+        expect(edit.orig_back).toBe('auto');
+        expect(edit.example).toBe('El coche azul.');
+        expect(edit.orig_example).toBeNull();
+        expect(edit.lesson_name).toBe('11.1 Edits');
+
+        // Usage counted as an extraction
+        const settings = await localApi.settings();
+        expect(settings.extractions_today).toBe(1);
       } finally {
         globalThis.fetch = originalFetch;
       }

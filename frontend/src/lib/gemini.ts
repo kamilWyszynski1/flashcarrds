@@ -29,6 +29,7 @@ export const MAX_IMAGES = 4;
 export const MAX_IMAGE_B64_BYTES = 8 * 1024 * 1024;
 export const MAX_TOTAL_B64_BYTES = 20 * 1024 * 1024;
 export const MAX_HINT_CHARS = 2000;
+export const MAX_EDIT_CARDS = 200;
 
 export function cleanModel(m: string): string {
   let cleaned = m.trim();
@@ -94,6 +95,98 @@ Rules:
   }
   p += `\nReturn only JSON matching the schema.`;
   return p;
+}
+
+export function buildGeneratePrompt(frontLang: string, backLang: string, prompt: string): string {
+  const p = prompt.trim();
+  return `You are helping a learner create vocabulary flashcards.
+The learner is studying ${frontLang} (front) -> ${backLang} (back).
+The learner wants to create flashcards for:
+${p}
+
+Card format:
+- "front": word, conjugated form (include subject pronoun like yo soy when conjugating verbs so each card is unambiguous, unless asked otherwise), or short phrase in ${frontLang} (keep accents, ¿¡, and articles for nouns when appropriate).
+- "back": concise translation in ${backLang} (add brief disambiguation in parentheses when helpful).
+- "example": optional short example sentence in ${frontLang} if requested or particularly helpful; otherwise omit.
+- "confidence": number 0..1 (1.0 when certain).
+
+Rules:
+- Do not repeat identical front values.
+- Keep the set focused and practical (typically 6–25 cards unless a specific count/list is requested).
+- Return only JSON matching the schema.
+`;
+}
+
+export interface EditCardInput {
+  id: number;
+  front: string;
+  back: string;
+  example?: string | null;
+}
+
+export interface RawCardEdit {
+  id: number;
+  front: string;
+  back: string;
+  example: string | null;
+}
+
+export function buildBatchEditPrompt(
+  frontLang: string,
+  backLang: string,
+  prompt: string,
+  cards: EditCardInput[],
+): string {
+  const p = prompt.trim();
+  const inputCardsJson = JSON.stringify(
+    cards.map((c) => ({
+      id: c.id,
+      front: c.front,
+      back: c.back,
+      ...(c.example ? { example: c.example } : {}),
+    }))
+  );
+  return `You are helping a learner batch-edit existing vocabulary flashcards.
+The flashcards have:
+- "front" in ${frontLang}
+- "back" in ${backLang}
+- optional "example" sentence in ${frontLang}
+
+The learner's instruction for editing these cards:
+${p}
+
+Rules:
+- Return ONLY cards that actually need changes to satisfy the instruction; omit cards that need no change.
+- Every returned item MUST keep its exact "id" from the input JSON list. Never invent new IDs.
+- When adding context/disambiguation (e.g. differentiating ser vs estar), keep it concise (e.g. short note in parentheses on back or front as appropriate) while preserving accurate translations.
+- Keep existing example if still valid (unless asked to change/remove it), or add/update example if requested/helpful.
+- Return only JSON matching the schema.
+
+Input cards:
+${inputCardsJson}
+`;
+}
+
+export function editResponseSchema(): unknown {
+  return {
+    type: 'object',
+    properties: {
+      edits: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            id: { type: 'integer' },
+            front: { type: 'string' },
+            back: { type: 'string' },
+            example: { type: 'string' },
+          },
+          required: ['id', 'front', 'back'],
+        },
+      },
+    },
+    required: ['edits'],
+  };
 }
 
 export function responseSchema(): unknown {
@@ -194,6 +287,55 @@ export function parseResponse(v: any): ExtractedCard[] {
   return out;
 }
 
+export function parseEditResponse(v: any): RawCardEdit[] {
+  if (v?.promptFeedback?.blockReason) {
+    throw new Error(`request was blocked by Gemini (${v.promptFeedback.blockReason})`);
+  }
+  const candidate = v?.candidates?.[0];
+  if (!candidate) {
+    throw new Error('no candidates in response');
+  }
+  const parts = candidate.content?.parts;
+  const text = Array.isArray(parts) ? parts.map((p: any) => p?.text ?? '').join('') : '';
+  if (!text.trim()) {
+    const finish = candidate.finishReason || 'unknown';
+    throw new Error(`empty answer (finishReason: ${finish})`);
+  }
+  let parsed: any;
+  try {
+    parsed = JSON.parse(stripCodeFence(text));
+  } catch (e) {
+    throw new Error(`answer was not valid JSON: ${(e as Error).message}`);
+  }
+  let rawEdits: any[];
+  if (Array.isArray(parsed)) {
+    rawEdits = parsed;
+  } else if (parsed && typeof parsed === 'object' && Array.isArray(parsed.edits)) {
+    rawEdits = parsed.edits;
+  } else {
+    throw new Error('answer has no "edits" array');
+  }
+  const out: RawCardEdit[] = [];
+  for (const c of rawEdits) {
+    if (typeof c?.id !== 'number' || !Number.isFinite(c.id)) {
+      continue;
+    }
+    const front = String(c.front || '').trim();
+    const back = String(c.back || '').trim();
+    if (!front || !back) {
+      continue;
+    }
+    const example = c.example ? String(c.example).trim() || null : null;
+    out.push({
+      id: Math.round(c.id),
+      front,
+      back,
+      example,
+    });
+  }
+  return out;
+}
+
 export function truncateBody(s: string, limit = BODY_LOG_LIMIT): string {
   if (s.length <= limit) return s;
   return `${s.slice(0, limit)}… [${s.length} bytes total]`;
@@ -258,6 +400,115 @@ export class RateLimiter {
   }
 }
 
+interface SendGeminiRequestOpts<T> {
+  url: string;
+  apiKey: string;
+  bodyJson: string;
+  timeoutMs: number;
+  signal?: AbortSignal;
+  fetchImpl?: typeof fetch;
+  formatError: (stage: string, elapsedMs: number, innerMsg: string) => string;
+  parseJson: (jsonVal: any) => T;
+}
+
+async function sendGeminiRequest<T>(opts: SendGeminiRequestOpts<T>): Promise<T> {
+  const fetchFn = opts.fetchImpl ?? (typeof window !== 'undefined' ? window.fetch.bind(window) : fetch);
+  const started = Date.now();
+  const backoffMs = Math.min(RETRY_BACKOFF_MS, Math.floor(opts.timeoutMs / 10));
+
+  let attempt = 1;
+  while (true) {
+    if (opts.signal?.aborted) {
+      const abortError = new DOMException('The user aborted a request.', 'AbortError');
+      throw abortError;
+    }
+
+    const elapsedSoFar = Date.now() - started;
+    const remainingBudgetMs = opts.timeoutMs - elapsedSoFar;
+    if (remainingBudgetMs <= 0) {
+      const totalElapsed = Date.now() - started;
+      const inner = `no answer from Gemini after ${totalElapsed} ms: timed out`;
+      throw new Error(opts.formatError('sending request', totalElapsed, inner));
+    }
+
+    const attemptController = new AbortController();
+    const attemptTimeoutId = setTimeout(() => {
+      attemptController.abort(new DOMException('Request timed out', 'TimeoutError'));
+    }, remainingBudgetMs);
+
+    const onCallerAbort = () => {
+      attemptController.abort(opts.signal?.reason || new DOMException('The user aborted a request.', 'AbortError'));
+    };
+    opts.signal?.addEventListener('abort', onCallerAbort);
+
+    const attemptStart = Date.now();
+    let resp: Response;
+    let text = '';
+    try {
+      resp = await fetchFn(opts.url, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-goog-api-key': opts.apiKey,
+        },
+        body: opts.bodyJson,
+        signal: attemptController.signal,
+      });
+      text = await resp.text();
+    } catch (e: any) {
+      clearTimeout(attemptTimeoutId);
+      opts.signal?.removeEventListener('abort', onCallerAbort);
+
+      if (opts.signal?.aborted) {
+        throw new DOMException('The user aborted a request.', 'AbortError');
+      }
+
+      const attemptElapsed = Date.now() - attemptStart;
+      const totalElapsed = Date.now() - started;
+      const isTimeout = e?.name === 'TimeoutError' || (e?.name === 'AbortError' && !opts.signal?.aborted);
+      const inner = isTimeout
+        ? `no answer from Gemini after ${attemptElapsed} ms: timed out`
+        : `could not reach Gemini after ${attemptElapsed} ms: ${e?.message || 'network error'}`;
+      throw new Error(opts.formatError('sending request', totalElapsed, inner));
+    } finally {
+      clearTimeout(attemptTimeoutId);
+      opts.signal?.removeEventListener('abort', onCallerAbort);
+    }
+
+    const attemptElapsed = Date.now() - attemptStart;
+    const totalElapsed = Date.now() - started;
+
+    if (!resp.ok) {
+      const { apiStatus, message } = parseErrorBody(text);
+      const remainingAfterAttempt = opts.timeoutMs - (Date.now() - started + backoffMs);
+      const willRetry =
+        attempt === 1 &&
+        resp.status === 503 &&
+        attemptElapsed < RETRY_IF_FASTER_THAN_MS &&
+        remainingAfterAttempt >= MIN_RETRY_BUDGET_MS;
+
+      if (willRetry) {
+        await new Promise((resolve) => setTimeout(resolve, backoffMs));
+        attempt += 1;
+        continue;
+      }
+
+      const statusPart = apiStatus ? ` ${apiStatus}` : '';
+      const msg = message || truncateBody(text.trim(), 300);
+      const inner = `Gemini answered HTTP ${resp.status}${statusPart}: ${msg}`;
+      throw new Error(opts.formatError('upstream_status', totalElapsed, inner));
+    }
+
+    try {
+      const jsonVal = JSON.parse(text);
+      return opts.parseJson(jsonVal);
+    } catch (e: any) {
+      const inner = `could not understand Gemini's answer: ${e?.message || 'parse error'}`;
+      throw new Error(opts.formatError('parse', totalElapsed, inner));
+    }
+  }
+}
+
 export async function extractFromGemini(opts: {
   apiKey: string;
   model: string;
@@ -280,8 +531,6 @@ export async function extractFromGemini(opts: {
 
   const baseUrl = (opts.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, '');
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const fetchFn = opts.fetchImpl ?? (typeof window !== 'undefined' ? window.fetch.bind(window) : fetch);
-
   const url = `${baseUrl}/models/${model}:generateContent`;
   const bodyObj = buildRequestBody({
     frontLang: opts.frontLang,
@@ -291,101 +540,128 @@ export async function extractFromGemini(opts: {
   });
   const bodyJson = JSON.stringify(bodyObj);
 
-  const started = Date.now();
-  const backoffMs = Math.min(RETRY_BACKOFF_MS, Math.floor(timeoutMs / 10));
+  return sendGeminiRequest({
+    url,
+    apiKey,
+    bodyJson,
+    timeoutMs,
+    signal: opts.signal,
+    fetchImpl: opts.fetchImpl,
+    formatError: (stage, elapsedMs, innerMsg) =>
+      formatContext(stage, model, opts.images, opts.hint, elapsedMs, innerMsg),
+    parseJson: parseResponse,
+  });
+}
 
-  let attempt = 1;
-  while (true) {
-    if (opts.signal?.aborted) {
-      const abortError = new DOMException('The user aborted a request.', 'AbortError');
-      throw abortError;
-    }
-
-    const elapsedSoFar = Date.now() - started;
-    const remainingBudgetMs = timeoutMs - elapsedSoFar;
-    if (remainingBudgetMs <= 0) {
-      const totalElapsed = Date.now() - started;
-      const inner = `no answer from Gemini after ${totalElapsed} ms: timed out`;
-      throw new Error(formatContext('sending request', model, opts.images, opts.hint, totalElapsed, inner));
-    }
-
-    // Set up timeout controller for this attempt
-    const attemptController = new AbortController();
-    const attemptTimeoutId = setTimeout(() => {
-      attemptController.abort(new DOMException('Request timed out', 'TimeoutError'));
-    }, remainingBudgetMs);
-
-    const onCallerAbort = () => {
-      attemptController.abort(opts.signal?.reason || new DOMException('The user aborted a request.', 'AbortError'));
-    };
-    opts.signal?.addEventListener('abort', onCallerAbort);
-
-    const attemptStart = Date.now();
-    let resp: Response;
-    let text = '';
-    try {
-      resp = await fetchFn(url, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'x-goog-api-key': apiKey,
-        },
-        body: bodyJson,
-        signal: attemptController.signal,
-      });
-      text = await resp.text();
-    } catch (e: any) {
-      clearTimeout(attemptTimeoutId);
-      opts.signal?.removeEventListener('abort', onCallerAbort);
-
-      if (opts.signal?.aborted) {
-        throw new DOMException('The user aborted a request.', 'AbortError');
-      }
-
-      const attemptElapsed = Date.now() - attemptStart;
-      const totalElapsed = Date.now() - started;
-      const isTimeout = e?.name === 'TimeoutError' || (e?.name === 'AbortError' && !opts.signal?.aborted);
-      const inner = isTimeout
-        ? `no answer from Gemini after ${attemptElapsed} ms: timed out`
-        : `could not reach Gemini after ${attemptElapsed} ms: ${e?.message || 'network error'}`;
-      throw new Error(formatContext('sending request', model, opts.images, opts.hint, totalElapsed, inner));
-    } finally {
-      clearTimeout(attemptTimeoutId);
-      opts.signal?.removeEventListener('abort', onCallerAbort);
-    }
-
-    const attemptElapsed = Date.now() - attemptStart;
-    const totalElapsed = Date.now() - started;
-
-    if (!resp.ok) {
-      const { apiStatus, message } = parseErrorBody(text);
-      const remainingAfterAttempt = timeoutMs - (Date.now() - started + backoffMs);
-      const willRetry =
-        attempt === 1 &&
-        resp.status === 503 &&
-        attemptElapsed < RETRY_IF_FASTER_THAN_MS &&
-        remainingAfterAttempt >= MIN_RETRY_BUDGET_MS;
-
-      if (willRetry) {
-        await new Promise((resolve) => setTimeout(resolve, backoffMs));
-        attempt += 1;
-        continue;
-      }
-
-      const statusPart = apiStatus ? ` ${apiStatus}` : '';
-      const msg = message || truncateBody(text.trim(), 300);
-      const inner = `Gemini answered HTTP ${resp.status}${statusPart}: ${msg}`;
-      throw new Error(formatContext('upstream_status', model, opts.images, opts.hint, totalElapsed, inner));
-    }
-
-    try {
-      const jsonVal = JSON.parse(text);
-      return parseResponse(jsonVal);
-    } catch (e: any) {
-      const inner = `could not understand Gemini's answer: ${e?.message || 'parse error'}`;
-      throw new Error(formatContext('parse', model, opts.images, opts.hint, totalElapsed, inner));
-    }
+export async function generateFromGemini(opts: {
+  apiKey: string;
+  model: string;
+  prompt: string;
+  frontLang: string;
+  backLang: string;
+  signal?: AbortSignal;
+  baseUrl?: string;
+  timeoutMs?: number;
+  fetchImpl?: typeof fetch;
+}): Promise<ExtractedCard[]> {
+  const apiKey = opts.apiKey.trim();
+  if (!apiKey) {
+    throw new Error('Gemini API key is not configured – set GEMINI_API_KEY on the server');
   }
+
+  const promptText = opts.prompt.trim();
+  if (!promptText) {
+    throw new Error('prompt cannot be empty');
+  }
+
+  const model = cleanModel(opts.model);
+  const baseUrl = (opts.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, '');
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const url = `${baseUrl}/models/${model}:generateContent`;
+
+  const bodyObj = {
+    contents: [{ role: 'user', parts: [{ text: buildGeneratePrompt(opts.frontLang, opts.backLang, promptText) }] }],
+    generationConfig: {
+      temperature: 0.3,
+      response_mime_type: 'application/json',
+      response_schema: responseSchema(),
+    },
+  };
+  const bodyJson = JSON.stringify(bodyObj);
+
+  return sendGeminiRequest({
+    url,
+    apiKey,
+    bodyJson,
+    timeoutMs,
+    signal: opts.signal,
+    fetchImpl: opts.fetchImpl,
+    formatError: (stage, elapsedMs, innerMsg) =>
+      `Gemini card generation failed at stage '${stage}' (model ${model}, prompt ${promptText.length} chars, ${elapsedMs} ms): ${innerMsg}`,
+    parseJson: parseResponse,
+  });
+}
+
+export async function editCardsWithGemini(opts: {
+  apiKey: string;
+  model: string;
+  prompt: string;
+  cards: EditCardInput[];
+  frontLang: string;
+  backLang: string;
+  signal?: AbortSignal;
+  baseUrl?: string;
+  timeoutMs?: number;
+  fetchImpl?: typeof fetch;
+}): Promise<RawCardEdit[]> {
+  const apiKey = opts.apiKey.trim();
+  if (!apiKey) {
+    throw new Error('Gemini API key is not configured – set GEMINI_API_KEY on the server');
+  }
+
+  const promptText = opts.prompt.trim();
+  if (!promptText) {
+    throw new Error('prompt cannot be empty');
+  }
+
+  if (opts.cards.length === 0) {
+    throw new Error('no cards to edit');
+  }
+  if (opts.cards.length > MAX_EDIT_CARDS) {
+    throw new Error(`too many cards (max ${MAX_EDIT_CARDS})`);
+  }
+
+  const model = cleanModel(opts.model);
+  const baseUrl = (opts.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, '');
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const url = `${baseUrl}/models/${model}:generateContent`;
+
+  const bodyObj = {
+    contents: [
+      {
+        role: 'user',
+        parts: [{ text: buildBatchEditPrompt(opts.frontLang, opts.backLang, promptText, opts.cards) }],
+      },
+    ],
+    generationConfig: {
+      temperature: 0.2,
+      response_mime_type: 'application/json',
+      response_schema: editResponseSchema(),
+    },
+  };
+  const bodyJson = JSON.stringify(bodyObj);
+
+  return sendGeminiRequest({
+    url,
+    apiKey,
+    bodyJson,
+    timeoutMs,
+    signal: opts.signal,
+    fetchImpl: opts.fetchImpl,
+    formatError: (stage, elapsedMs, innerMsg) =>
+      `Gemini card edit failed at stage '${stage}' (model ${model}, ${opts.cards.length} cards, prompt ${promptText.length} chars, ${elapsedMs} ms): ${innerMsg}`,
+    parseJson: parseEditResponse,
+  });
 }
 
 export interface ProbeModelOptions {
@@ -478,19 +754,12 @@ export interface FallbackProgress {
   tried: { model: string; error: string }[];
 }
 
-export async function extractWithModelFallback(
-  extractFn: (
-    images: { mime_type: string; data: string }[],
-    hint: string,
-    signal?: AbortSignal,
-    opts?: ExtractOptions,
-  ) => Promise<ExtractResponse>,
-  images: { mime_type: string; data: string }[],
-  hint: string,
+export async function runWithModelFallback<T>(
+  runFn: (signal: AbortSignal | undefined, opts: ExtractOptions) => Promise<T>,
   candidateModels: string[],
   signal?: AbortSignal,
   onProgress?: (progress: FallbackProgress) => void,
-): Promise<ExtractResponse> {
+): Promise<T> {
   if (candidateModels.length === 0) {
     throw new Error('No models specified for extraction');
   }
@@ -512,7 +781,7 @@ export async function extractWithModelFallback(
     });
 
     try {
-      const res = await extractFn(images, hint, signal, {
+      const res = await runFn(signal, {
         model: currentModel,
         timeoutMs: 12_000,
         skipRateLimit: i > 0,
@@ -544,4 +813,25 @@ export async function extractWithModelFallback(
   }
 
   throw new Error('All models exhausted');
+}
+
+export async function extractWithModelFallback(
+  extractFn: (
+    images: { mime_type: string; data: string }[],
+    hint: string,
+    signal?: AbortSignal,
+    opts?: ExtractOptions,
+  ) => Promise<ExtractResponse>,
+  images: { mime_type: string; data: string }[],
+  hint: string,
+  candidateModels: string[],
+  signal?: AbortSignal,
+  onProgress?: (progress: FallbackProgress) => void,
+): Promise<ExtractResponse> {
+  return runWithModelFallback(
+    (sig, opts) => extractFn(images, hint, sig, opts),
+    candidateModels,
+    signal,
+    onProgress,
+  );
 }

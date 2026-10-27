@@ -4,10 +4,14 @@ import { db, DEFAULT_SETTINGS, type DbCard, type DbLesson, type DbUnit } from '.
 import {
   RateLimiter,
   cleanModel,
+  editCardsWithGemini,
   extractFromGemini,
+  generateFromGemini,
   probeGeminiModel,
   validateImages,
+  MAX_EDIT_CARDS,
   MAX_HINT_CHARS,
+  type RawCardEdit,
 } from './gemini';
 import {
   fmtDays,
@@ -27,6 +31,9 @@ import {
   type SrsState,
 } from './srs';
 import type {
+  AiCardEdit,
+  AiEditResponse,
+  BulkCardUpdate,
   Card,
   Counts,
   ExtractedCard,
@@ -176,6 +183,100 @@ function shuffle<T>(array: T[]): void {
     const j = Math.floor(Math.random() * (i + 1));
     [array[i], array[j]] = [array[j], array[i]];
   }
+}
+
+async function prepareGeminiCall(opts?: ExtractOptions): Promise<{
+  apiKey: string;
+  model: string;
+  frontLang: string;
+  backLang: string;
+}> {
+  const settingsRows = await db.settings.toArray();
+  const map = new Map(settingsRows.map((s) => [s.key, s.value]));
+
+  const extractionPaused = map.get('extraction_paused') === 'true' || map.get('gemini_paused') === '1';
+  if (extractionPaused) {
+    throw new ApiError(403, 'paused', 'Extraction is paused – switch it back on in Settings');
+  }
+
+  const apiKey = (map.get('gemini_api_key') ?? '').trim();
+  if (!apiKey) {
+    throw new ApiError(400, 'no_api_key', 'Gemini API key is not configured – add your key in Settings');
+  }
+
+  let model: string;
+  if (opts?.model) {
+    try {
+      model = cleanModel(opts.model);
+      await setSettingValue('gemini_model', model);
+    } catch (e: any) {
+      throw new ApiError(400, 'validation', e.message);
+    }
+  } else {
+    const rawModel = map.get('gemini_model') ?? DEFAULT_SETTINGS.gemini_model;
+    try {
+      model = cleanModel(rawModel);
+    } catch (e: any) {
+      throw new ApiError(400, 'validation', e.message);
+    }
+  }
+
+  const capStr = map.get('extract_daily_cap') ?? map.get('gemini_daily_limit') ?? DEFAULT_SETTINGS.gemini_daily_limit;
+  const cap = parseInt(capStr, 10) || 0;
+  const now = nowTs();
+  const currentUsage = await getExtractionUsage(now);
+  if (cap > 0 && currentUsage.today >= cap) {
+    throw new ApiError(429, 'rate_limit', `Daily extraction limit reached (${cap}/day) – try again tomorrow`);
+  }
+
+  if (!opts?.skipRateLimit) {
+    const rpmStr = map.get('gemini_rpm_limit') ?? DEFAULT_SETTINGS.gemini_rpm_limit;
+    const rpm = parseInt(rpmStr, 10) || 6;
+    rateLimiter.setMax(rpm);
+    const limiterCheck = rateLimiter.check();
+    if (!limiterCheck.ok) {
+      throw new ApiError(429, 'rate_limit', `Too many extractions in a row – wait ${limiterCheck.waitSecs}s and try again`);
+    }
+  }
+
+  await recordExtraction(now);
+
+  const frontLang = map.get('front_lang') ?? DEFAULT_SETTINGS.front_lang;
+  const backLang = map.get('back_lang') ?? DEFAULT_SETTINGS.back_lang;
+
+  return { apiKey, model, frontLang, backLang };
+}
+
+async function annotateExistingCards(cards: ExtractedCard[]): Promise<ExtractedCard[]> {
+  const [allDbCards, allLessons] = await Promise.all([db.cards.toArray(), db.lessons.toArray()]);
+  const lessonMap = new Map(allLessons.map((l) => [l.id!, l.name]));
+
+  const existingFronts = new Map<string, { id: number; lessonName: string }>();
+  for (const c of allDbCards) {
+    const norm = normalizeFront(c.front);
+    if (!existingFronts.has(norm)) {
+      existingFronts.set(norm, { id: c.id!, lessonName: lessonMap.get(c.lesson_id) ?? '' });
+    }
+  }
+
+  const seen = new Set<string>();
+  const deduplicated: ExtractedCard[] = [];
+  for (const card of cards) {
+    const norm = normalizeFront(card.front);
+    if (seen.has(norm)) {
+      continue;
+    }
+    seen.add(norm);
+
+    const existing = existingFronts.get(norm);
+    if (existing) {
+      card.existing_in = existing.lessonName;
+      card.existing_card_id = existing.id;
+    }
+    deduplicated.push(card);
+  }
+
+  return deduplicated;
 }
 
 export const localApi: FiszkiApi = {
@@ -617,6 +718,44 @@ export const localApi: FiszkiApi = {
     return enrichCard(updated!, lesson, unit, ts);
   },
 
+  async updateCardsBulk(updates: BulkCardUpdate[]): Promise<{ updated: number }> {
+    if (!updates || updates.length === 0) {
+      throw new ApiError(400, 'validation', 'no updates to apply');
+    }
+    if (updates.length > 500) {
+      throw new ApiError(400, 'validation', 'too many updates (max 500)');
+    }
+    const cleanedUpdates = updates.map((u) => {
+      const front = u.front?.trim() ?? '';
+      const back = u.back?.trim() ?? '';
+      if (!front || !back) {
+        throw new ApiError(400, 'validation', 'front and back are required');
+      }
+      if (front.length > 500 || back.length > 500) {
+        throw new ApiError(400, 'validation', 'card text is too long (max 500 characters per side)');
+      }
+      const example = u.example ? u.example.trim() || null : null;
+      return { id: u.id, front, back, example };
+    });
+
+    const ts = nowTs();
+    let updated = 0;
+    await db.transaction('rw', db.cards, async () => {
+      for (const u of cleanedUpdates) {
+        const existing = await db.cards.get(u.id);
+        if (!existing) continue;
+        await db.cards.update(u.id, {
+          front: u.front,
+          back: u.back,
+          example: u.example,
+          updated_at: ts,
+        });
+        updated += 1;
+      }
+    });
+    return { updated };
+  },
+
   async deleteCard(id: number): Promise<void> {
     const cur = await db.cards.get(id);
     if (!cur) {
@@ -808,58 +947,7 @@ export const localApi: FiszkiApi = {
     }
     const truncatedHint = (hint ?? '').slice(0, MAX_HINT_CHARS);
 
-    const settingsRows = await db.settings.toArray();
-    const map = new Map(settingsRows.map((s) => [s.key, s.value]));
-
-    const extractionPaused = map.get('extraction_paused') === 'true' || map.get('gemini_paused') === '1';
-    if (extractionPaused) {
-      throw new ApiError(403, 'paused', 'Extraction is paused – switch it back on in Settings');
-    }
-
-    const apiKey = (map.get('gemini_api_key') ?? '').trim();
-    if (!apiKey) {
-      throw new ApiError(400, 'no_api_key', 'Gemini API key is not configured – add your key in Settings');
-    }
-
-    let model: string;
-    if (opts?.model) {
-      try {
-        model = cleanModel(opts.model);
-        await setSettingValue('gemini_model', model);
-      } catch (e: any) {
-        throw new ApiError(400, 'validation', e.message);
-      }
-    } else {
-      const rawModel = map.get('gemini_model') ?? DEFAULT_SETTINGS.gemini_model;
-      try {
-        model = cleanModel(rawModel);
-      } catch (e: any) {
-        throw new ApiError(400, 'validation', e.message);
-      }
-    }
-
-    const capStr = map.get('extract_daily_cap') ?? map.get('gemini_daily_limit') ?? DEFAULT_SETTINGS.gemini_daily_limit;
-    const cap = parseInt(capStr, 10) || 0;
-    const now = nowTs();
-    const currentUsage = await getExtractionUsage(now);
-    if (cap > 0 && currentUsage.today >= cap) {
-      throw new ApiError(429, 'rate_limit', `Daily extraction limit reached (${cap}/day) – try again tomorrow`);
-    }
-
-    if (!opts?.skipRateLimit) {
-      const rpmStr = map.get('gemini_rpm_limit') ?? DEFAULT_SETTINGS.gemini_rpm_limit;
-      const rpm = parseInt(rpmStr, 10) || 6;
-      rateLimiter.setMax(rpm);
-      const limiterCheck = rateLimiter.check();
-      if (!limiterCheck.ok) {
-        throw new ApiError(429, 'rate_limit', `Too many extractions in a row – wait ${limiterCheck.waitSecs}s and try again`);
-      }
-    }
-
-    await recordExtraction(now);
-
-    const frontLang = map.get('front_lang') ?? DEFAULT_SETTINGS.front_lang;
-    const backLang = map.get('back_lang') ?? DEFAULT_SETTINGS.back_lang;
+    const { apiKey, model, frontLang, backLang } = await prepareGeminiCall(opts);
 
     let extractedCards: ExtractedCard[];
     try {
@@ -880,38 +968,139 @@ export const localApi: FiszkiApi = {
       throw new ApiError(502, 'upstream', e.message);
     }
 
-    const [allDbCards, allLessons] = await Promise.all([db.cards.toArray(), db.lessons.toArray()]);
-    const lessonMap = new Map(allLessons.map((l) => [l.id!, l.name]));
-
-    const existingFronts = new Map<string, { id: number; lessonName: string }>();
-    for (const c of allDbCards) {
-      const norm = normalizeFront(c.front);
-      if (!existingFronts.has(norm)) {
-        existingFronts.set(norm, { id: c.id!, lessonName: lessonMap.get(c.lesson_id) ?? '' });
-      }
-    }
-
-    const seen = new Set<string>();
-    const deduplicated: ExtractedCard[] = [];
-    for (const card of extractedCards) {
-      const norm = normalizeFront(card.front);
-      if (seen.has(norm)) {
-        continue;
-      }
-      seen.add(norm);
-
-      const existing = existingFronts.get(norm);
-      if (existing) {
-        card.existing_in = existing.lessonName;
-        card.existing_card_id = existing.id;
-      }
-      deduplicated.push(card);
-    }
+    const deduplicated = await annotateExistingCards(extractedCards);
 
     return {
       cards: deduplicated,
       model,
       hint: truncatedHint,
+    };
+  },
+
+  async generate(
+    prompt: string,
+    signal?: AbortSignal,
+    opts?: ExtractOptions,
+  ): Promise<ExtractResponse> {
+    const trimmed = (prompt ?? '').trim();
+    if (!trimmed) {
+      throw new ApiError(400, 'validation', 'prompt cannot be empty');
+    }
+    const truncatedPrompt = trimmed.slice(0, MAX_HINT_CHARS);
+
+    const { apiKey, model, frontLang, backLang } = await prepareGeminiCall(opts);
+
+    let extractedCards: ExtractedCard[];
+    try {
+      extractedCards = await generateFromGemini({
+        apiKey,
+        model,
+        prompt: truncatedPrompt,
+        frontLang,
+        backLang,
+        signal,
+        timeoutMs: opts?.timeoutMs,
+      });
+    } catch (e: any) {
+      if (e?.name === 'AbortError' || signal?.aborted) {
+        throw e;
+      }
+      throw new ApiError(502, 'upstream', e.message);
+    }
+
+    const deduplicated = await annotateExistingCards(extractedCards);
+
+    return {
+      cards: deduplicated,
+      model,
+      hint: truncatedPrompt,
+    };
+  },
+
+  async aiEditCards(
+    cardIds: number[],
+    prompt: string,
+    signal?: AbortSignal,
+    opts?: ExtractOptions,
+  ): Promise<AiEditResponse> {
+    const trimmed = (prompt ?? '').trim();
+    if (!trimmed) {
+      throw new ApiError(400, 'validation', 'prompt cannot be empty');
+    }
+    const truncatedPrompt = trimmed.slice(0, MAX_HINT_CHARS);
+
+    if (!cardIds || cardIds.length === 0) {
+      throw new ApiError(400, 'validation', 'no cards selected');
+    }
+    if (cardIds.length > MAX_EDIT_CARDS) {
+      throw new ApiError(400, 'validation', `too many cards (max ${MAX_EDIT_CARDS})`);
+    }
+
+    const uniqueIds = Array.from(new Set(cardIds));
+    const [allDbCards, allLessons] = await Promise.all([db.cards.toArray(), db.lessons.toArray()]);
+    const cardMap = new Map(allDbCards.map((c) => [c.id!, c]));
+    const lessonMap = new Map(allLessons.map((l) => [l.id!, l.name]));
+
+    const origCards: DbCard[] = [];
+    for (const id of uniqueIds) {
+      const c = cardMap.get(id);
+      if (c) origCards.push(c);
+    }
+    if (origCards.length === 0) {
+      throw new ApiError(400, 'validation', 'no valid cards found');
+    }
+
+    const { apiKey, model, frontLang, backLang } = await prepareGeminiCall(opts);
+
+    let rawEdits: RawCardEdit[];
+    try {
+      rawEdits = await editCardsWithGemini({
+        apiKey,
+        model,
+        prompt: truncatedPrompt,
+        cards: origCards.map((c) => ({ id: c.id!, front: c.front, back: c.back, example: c.example })),
+        frontLang,
+        backLang,
+        signal,
+        timeoutMs: opts?.timeoutMs,
+      });
+    } catch (e: any) {
+      if (e?.name === 'AbortError' || signal?.aborted) {
+        throw e;
+      }
+      throw new ApiError(502, 'upstream', e.message);
+    }
+
+    const origMap = new Map(origCards.map((c) => [c.id!, c]));
+    const seenEditIds = new Set<number>();
+    const edits: AiCardEdit[] = [];
+    for (const edit of rawEdits) {
+      if (seenEditIds.has(edit.id)) continue;
+      const orig = origMap.get(edit.id);
+      if (!orig) continue;
+      seenEditIds.add(edit.id);
+      const changed =
+        edit.front !== orig.front ||
+        edit.back !== orig.back ||
+        (edit.example ?? null) !== (orig.example ?? null);
+      if (!changed) continue;
+      edits.push({
+        card_id: orig.id!,
+        front: edit.front,
+        back: edit.back,
+        example: edit.example ?? null,
+        orig_front: orig.front,
+        orig_back: orig.back,
+        orig_example: orig.example ?? null,
+        lesson_name: lessonMap.get(orig.lesson_id) ?? '',
+      });
+    }
+
+    return {
+      edits,
+      model,
+      prompt: truncatedPrompt,
+      inspected: origCards.length,
     };
   },
 

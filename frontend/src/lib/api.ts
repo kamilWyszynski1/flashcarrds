@@ -2,6 +2,8 @@ import { ApiError } from './api.errors';
 import { httpApi } from './api.http';
 import { localApi } from './api.local';
 import type {
+  AiEditResponse,
+  BulkCardUpdate,
   Card,
   ExtractOptions,
   ExtractResponse,
@@ -38,6 +40,7 @@ export interface FiszkiApi {
   createCard: (lesson_id: number, c: NewCard) => Promise<Card>;
   createCards: (lesson_id: number, cards: NewCard[]) => Promise<{ created: number; ids: number[]; lesson: Lesson }>;
   updateCard: (id: number, patch: { front?: string; back?: string; example?: string; lesson_id?: number; reset_progress?: boolean }) => Promise<Card>;
+  updateCardsBulk: (updates: BulkCardUpdate[]) => Promise<{ updated: number }>;
   deleteCard: (id: number) => Promise<void>;
 
   studyQueue: (p?: { scope?: string; mode?: string; ids?: string; limit?: number; direction?: string }) => Promise<StudyItem[]>;
@@ -49,6 +52,8 @@ export interface FiszkiApi {
     signal?: AbortSignal,
     opts?: ExtractOptions,
   ) => Promise<ExtractResponse>;
+  generate: (prompt: string, signal?: AbortSignal, opts?: ExtractOptions) => Promise<ExtractResponse>;
+  aiEditCards: (cardIds: number[], prompt: string, signal?: AbortSignal, opts?: ExtractOptions) => Promise<AiEditResponse>;
   probeModel?: (model: string, signal?: AbortSignal, timeoutMs?: number) => Promise<{ ok: boolean; latencyMs: number; status?: number; error?: string }>;
 
   settings: () => Promise<Settings>;

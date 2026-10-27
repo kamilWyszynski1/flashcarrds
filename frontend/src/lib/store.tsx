@@ -3,13 +3,27 @@ import { api } from './api';
 import { DEFAULT_THEME, applyTheme, isTheme, watchSystemTheme } from './theme';
 import type { ExtractedCard, Overview, Settings } from './types';
 
-/** Cards waiting on the Review screen (from a photo or a pasted list). */
+export interface DraftRow extends ExtractedCard {
+  include: boolean;
+  key: number;
+  /** Present when source === 'edit': existing card being updated in place. */
+  card_id?: number;
+  orig_front?: string;
+  orig_back?: string;
+  orig_example?: string | null;
+  lesson_name?: string;
+}
+
+/** Cards waiting on the Review screen (from a photo, pasted list, prompt, or batch edit). */
 export interface Draft {
-  source: 'photo' | 'paste' | 'manual';
-  cards: (ExtractedCard & { include: boolean; key: number })[];
+  source: 'photo' | 'paste' | 'manual' | 'prompt' | 'edit';
+  cards: DraftRow[];
   hint: string;
   previewUrl?: string;
   model?: string;
+  editLessonId?: number;
+  editCardIds?: number[];
+  editScopeLabel?: string;
 }
 
 export interface Toast {

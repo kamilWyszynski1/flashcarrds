@@ -54,6 +54,9 @@ export function Review() {
     );
   }
 
+  const isEdit = draft.source === 'edit';
+  const isPrompt = draft.source === 'prompt';
+
   const rows = draft.cards;
   const update = (key: number, patch: Partial<Row>) => setDraft((d) => d && { ...d, cards: d.cards.map((r) => (r.key === key ? { ...r, ...patch } : r)) });
   const remove = (key: number) => setDraft((d) => d && { ...d, cards: d.cards.filter((r) => r.key !== key) });
@@ -70,21 +73,37 @@ export function Review() {
   const incomplete = rows.filter((r) => r.include && (!r.front.trim() || !r.back.trim())).length;
 
   const save = async () => {
-    if (!target || selected.length === 0) return;
+    if (selected.length === 0) return;
+    if (!isEdit && !target) return;
     setSaving(true);
     setError(null);
     try {
-      const res = await api.createCards(
-        target.lesson.id,
-        selected.map((r) => ({ front: r.front.trim(), back: r.back.trim(), example: r.example?.trim() || null })),
-      );
-      setDraft(null);
-      void refresh();
-      const lessonId = target.lesson.id;
-      toast(`${res.created} ${res.created === 1 ? 'card' : 'cards'} saved to “${res.lesson.name}”`, { label: 'View', onClick: () => navigate(`/group/${lessonId}`) });
-      // Drop the capture flow from history so Back does not re-open it.
+      if (isEdit) {
+        const res = await api.updateCardsBulk(
+          selected.map((r) => ({
+            id: r.card_id!,
+            front: r.front.trim(),
+            back: r.back.trim(),
+            example: r.example?.trim() || null,
+          }))
+        );
+        setDraft(null);
+        void refresh();
+        toast(`${res.updated} ${res.updated === 1 ? 'card' : 'cards'} updated`);
+      } else {
+        const res = await api.createCards(
+          target!.lesson.id,
+          selected.map((r) => ({ front: r.front.trim(), back: r.back.trim(), example: r.example?.trim() || null })),
+        );
+        setDraft(null);
+        void refresh();
+        const lessonId = target!.lesson.id;
+        toast(`${res.created} ${res.created === 1 ? 'card' : 'cards'} saved to “${res.lesson.name}”`, { label: 'View', onClick: () => navigate(`/group/${lessonId}`) });
+      }
+
+      // Drop the capture/edit flow from history so Back does not re-open it.
       const idx = historyIdx();
-      const start = draft.source === 'photo' ? captureFlowStart() : null;
+      const start = (draft.source === 'photo' || draft.source === 'prompt' || draft.source === 'edit') ? captureFlowStart() : null;
       if (start !== null && start >= 1 && idx >= start) navigate(start - 1 - idx);
       else if (start === 0) navigate('/', { replace: true });
       else if (idx >= 1) navigate(-1);
@@ -95,11 +114,18 @@ export function Review() {
     }
   };
 
-  const subtitle = `${rows.length} ${rows.length === 1 ? 'card' : 'cards'} found · tap any text to edit`;
+  const subtitle = isEdit
+    ? `${rows.length} ${rows.length === 1 ? 'card' : 'cards'} updated · tap any text to edit`
+    : `${rows.length} ${rows.length === 1 ? 'card' : 'cards'} found · tap any text to edit`;
 
   return (
     <div className="min-h-dvh bg-surface pb-32">
-      <TopBar title="Review" subtitle={subtitle} back right={<IconButton icon="swap" label="Swap front/back for all" onClick={swap} />} />
+      <TopBar
+        title={isEdit ? 'Review edits' : 'Review'}
+        subtitle={subtitle}
+        back
+        right={!isEdit ? <IconButton icon="swap" label="Swap front/back for all" onClick={swap} /> : undefined}
+      />
       <main className="max-w-app mx-auto px-margin-mobile pt-2">
         {draft.source === 'photo' && (
           <div className="flex gap-3 items-center rounded-xl bg-surface-container-lowest shadow-card p-3 mb-3">
@@ -120,20 +146,59 @@ export function Review() {
           </div>
         )}
 
+        {(isPrompt || isEdit) && (
+          <div className="flex gap-3 items-center rounded-xl bg-surface-container-lowest shadow-card p-3 mb-3">
+            <div className="w-12 h-12 rounded-[10px] bg-primary-fixed text-on-primary-fixed-variant flex items-center justify-center shrink-0">
+              <Icon name="sparkle" size={22} />
+            </div>
+            <div className="flex-1 min-w-0 text-body-sm text-on-surface-variant leading-snug">
+              Prompt: <i>“{draft.hint.trim() ? short(draft.hint.trim()) : 'no prompt'}”</i>
+              <br />
+              <button
+                type="button"
+                className="text-primary font-semibold min-h-[40px]"
+                onClick={() =>
+                  navigate(
+                    isEdit ? `/edit-cards${draft.editLessonId ? `?lesson=${draft.editLessonId}` : ''}` : '/prompt',
+                    { replace: true, state: { retry: true, cardIds: draft.editCardIds, scopeLabel: draft.editScopeLabel } }
+                  )
+                }
+              >
+                Not right? Edit prompt &amp; retry
+              </button>
+            </div>
+          </div>
+        )}
+
         {rows.length === 0 && <Empty icon="sparkle" title="No cards found" text="Try a sharper photo, a tighter crop, or a different hint." />}
 
         <div ref={listRef} className="space-y-2.5">
           {rows.map((r) => (
-            <ReviewRow key={r.key} row={r} onChange={(p) => update(r.key, p)} onRemove={() => remove(r.key)} existingIn={existing?.get(normalize(r.front))} />
+            <ReviewRow
+              key={r.key}
+              row={r}
+              onChange={(p) => update(r.key, p)}
+              onRemove={() => remove(r.key)}
+              existingIn={existing?.get(normalize(r.front))}
+              isEdit={isEdit}
+              editLessonId={draft.editLessonId}
+            />
           ))}
         </div>
 
-        <button type="button" onClick={add} className="mt-3 w-full flex items-center justify-center gap-2 min-h-[52px] border-2 border-dashed border-outline-variant rounded-xl text-primary font-semibold text-label-lg">
-          <Icon name="plus" size={20} strokeWidth={2.2} /> Add a card the model missed
-        </button>
+        {!isEdit ? (
+          <>
+            <button type="button" onClick={add} className="mt-3 w-full flex items-center justify-center gap-2 min-h-[52px] border-2 border-dashed border-outline-variant rounded-xl text-primary font-semibold text-label-lg">
+              <Icon name="plus" size={20} strokeWidth={2.2} /> Add a card the model missed
+            </button>
 
-        <Label>Save to</Label>
-        <GroupSelector unit={target?.unit.name} lesson={target?.lesson.name} onClick={() => openPicker()} />
+            <Label>Save to</Label>
+            <GroupSelector unit={target?.unit.name} lesson={target?.lesson.name} onClick={() => openPicker()} />
+          </>
+        ) : (
+          <p className="text-body-sm text-on-surface-variant mt-3">Uncheck any card to leave it unchanged. Study progress is kept.</p>
+        )}
+
         {incomplete > 0 && <p className="text-body-sm text-on-surface-variant mt-2">{incomplete} ticked {incomplete === 1 ? 'row is' : 'rows are'} missing a side and will be skipped.</p>}
         {error && (
           <div className="mt-4">
@@ -142,17 +207,37 @@ export function Review() {
         )}
       </main>
       <Footer>
-        <Button className="flex-1" disabled={selected.length === 0 || saving || !target} onClick={() => void save()}>
-          {saving ? 'Saving…' : `Save ${selected.length} ${selected.length === 1 ? 'card' : 'cards'} to “${target?.lesson.name ?? '…'}”`}
-        </Button>
+        {isEdit ? (
+          <Button className="flex-1" disabled={selected.length === 0 || saving} onClick={() => void save()}>
+            {saving ? 'Updating…' : `Update ${selected.length} ${selected.length === 1 ? 'card' : 'cards'}`}
+          </Button>
+        ) : (
+          <Button className="flex-1" disabled={selected.length === 0 || saving || !target} onClick={() => void save()}>
+            {saving ? 'Saving…' : `Save ${selected.length} ${selected.length === 1 ? 'card' : 'cards'} to “${target?.lesson.name ?? '…'}”`}
+          </Button>
+        )}
       </Footer>
     </div>
   );
 }
 
-function ReviewRow({ row, onChange, onRemove, existingIn }: { row: Row; onChange: (p: Partial<Row>) => void; onRemove: () => void; existingIn?: string | null }) {
+function ReviewRow({
+  row,
+  onChange,
+  onRemove,
+  existingIn,
+  isEdit,
+  editLessonId,
+}: {
+  row: Row;
+  onChange: (p: Partial<Row>) => void;
+  onRemove: () => void;
+  existingIn?: string | null;
+  isEdit?: boolean;
+  editLessonId?: number;
+}) {
   const low = row.confidence < 0.7;
-  const dup = row.existing_in ?? existingIn;
+  const dup = !isEdit ? (row.existing_in ?? existingIn) : null;
   const input = 'w-full bg-surface-container-low rounded-[10px] px-3 min-h-[44px] text-[16px] text-on-surface border-2 border-transparent focus:border-primary focus:bg-surface-container-lowest outline-none placeholder:text-outline';
   return (
     <div className={`grid grid-cols-[40px_1fr_40px] gap-x-1.5 gap-y-2 items-center rounded-xl bg-surface-container-lowest shadow-card py-2.5 pl-1.5 pr-2 ${row.include ? '' : 'opacity-50'}`}>
@@ -171,8 +256,12 @@ function ReviewRow({ row, onChange, onRemove, existingIn }: { row: Row; onChange
       <div className="flex flex-col gap-1.5 min-w-0">
         <input data-front className={input} value={row.front} onChange={(e) => onChange({ front: e.target.value })} placeholder="front" autoCapitalize="none" />
         <input className={`${input} ${low ? 'border-secondary-container' : ''}`} value={row.back} onChange={(e) => onChange({ back: e.target.value })} placeholder="back" autoCapitalize="none" />
-        {row.example !== undefined && row.example !== null && (
+        {row.example !== undefined && row.example !== null ? (
           <input className={`${input} text-body-sm min-h-[40px]`} value={row.example} onChange={(e) => onChange({ example: e.target.value })} placeholder="example sentence" />
+        ) : (
+          <button type="button" onClick={() => onChange({ example: '' })} className="self-start text-label-md text-primary font-medium px-1">
+            + example
+          </button>
         )}
       </div>
       <button type="button" aria-label="Remove" onClick={onRemove} className="w-10 h-10 rounded-full flex items-center justify-center text-on-surface-variant">
@@ -187,6 +276,23 @@ function ReviewRow({ row, onChange, onRemove, existingIn }: { row: Row; onChange
         <div className="col-start-2 col-span-2 text-label-md text-on-surface-variant">
           Already in {dup}
           {row.include ? '' : ' – unchecked to avoid a duplicate'}
+        </div>
+      )}
+      {isEdit && (
+        <div className="col-start-2 col-span-2 text-label-md text-on-surface-variant space-y-0.5">
+          {row.orig_front !== undefined && (row.orig_front !== row.front || row.orig_back !== row.back) && (
+            <div>
+              Was: <span className="line-through opacity-80">{row.orig_front}</span> → <span className="line-through opacity-80">{row.orig_back}</span>
+            </div>
+          )}
+          {row.orig_example && row.orig_example !== (row.example?.trim() || null) && (
+            <div>
+              Prev example: <span className="line-through opacity-80">{row.orig_example}</span>
+            </div>
+          )}
+          {row.lesson_name && !editLessonId && (
+            <div className="text-outline">In {row.lesson_name}</div>
+          )}
         </div>
       )}
     </div>

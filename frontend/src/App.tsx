@@ -6,6 +6,7 @@ import { AllCards } from './screens/AllCards';
 import { Capture } from './screens/Capture';
 import { GroupDetail } from './screens/GroupDetail';
 import { Home } from './screens/Home';
+import { PromptCreate, BatchEdit } from './screens/PromptCards';
 import { Review } from './screens/Review';
 import { Settings } from './screens/Settings';
 import { Study } from './screens/Study';
@@ -34,6 +35,8 @@ export function App() {
           <Route path="/" element={<Home />} />
           <Route path="/all" element={<AllCards />} />
           <Route path="/capture" element={<Capture />} />
+          <Route path="/prompt" element={<PromptCreate />} />
+          <Route path="/edit-cards" element={<BatchEdit />} />
           <Route path="/review" element={<Review />} />
           <Route path="/group/:id" element={<GroupDetail />} />
           <Route path="/study" element={<Study />} />

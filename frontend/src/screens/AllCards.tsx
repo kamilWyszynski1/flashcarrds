@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Icon } from '../components/Icon';
-import { BottomNav, Chip, Empty, ErrorBox, Fab, Spinner, TopBar } from '../components/ui';
+import { BottomNav, Chip, Empty, ErrorBox, Fab, IconButton, Spinner, TopBar } from '../components/ui';
 import { WordList } from '../components/WordRow';
 import { api } from '../lib/api';
 import { plural } from '../lib/format';
@@ -56,7 +56,26 @@ export function AllCards() {
 
   return (
     <div className="min-h-dvh bg-surface pb-36">
-      <TopBar title="All cards" subtitle={overview ? `${plural(overview.total, 'card')} · ${plural(overview.units.length, 'unit')} · ${plural(lessons, 'lesson')}` : ' '} />
+      <TopBar
+        title="All cards"
+        subtitle={overview ? `${plural(overview.total, 'card')} · ${plural(overview.units.length, 'unit')} · ${plural(lessons, 'lesson')}` : ' '}
+        right={
+          shown.length > 0 ? (
+            <IconButton
+              icon="edit"
+              label="Edit cards with prompt"
+              onClick={() =>
+                navigate('/edit-cards', {
+                  state: {
+                    cardIds: shown.slice(0, 200).map((c) => c.id),
+                    scopeLabel: q || filter !== 'all' ? `${shown.length} matching cards` : `All ${Math.min(shown.length, 200)} cards`,
+                  },
+                })
+              }
+            />
+          ) : undefined
+        }
+      />
       <main className="max-w-app mx-auto px-margin-mobile pt-2">
         {error && <ErrorBox message={error} />}
         {!cards && !error && (

@@ -177,3 +177,26 @@ pub struct ExtractedCard {
 fn default_confidence() -> f64 {
     1.0
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AiCardEdit {
+    pub card_id: i64,
+    pub front: String,
+    pub back: String,
+    #[serde(default)]
+    pub example: Option<String>,
+    pub orig_front: String,
+    pub orig_back: String,
+    #[serde(default)]
+    pub orig_example: Option<String>,
+    pub lesson_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BulkCardUpdate {
+    pub id: i64,
+    pub front: String,
+    pub back: String,
+    #[serde(default)]
+    pub example: Option<String>,
+}

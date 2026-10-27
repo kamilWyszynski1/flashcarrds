@@ -18,27 +18,45 @@ use crate::srs::{self, Grade, SrsState, STATE_NEW};
 pub fn list_units(conn: &Connection) -> Result<Vec<Unit>> {
     let mut st = conn.prepare("SELECT id, name, position FROM units ORDER BY position, id")?;
     let rows = st.query_map([], |r| {
-        Ok(Unit { id: r.get(0)?, name: r.get(1)?, position: r.get(2)? })
+        Ok(Unit {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            position: r.get(2)?,
+        })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
 pub fn get_unit(conn: &Connection, id: i64) -> Result<Option<Unit>> {
     Ok(conn
-        .query_row("SELECT id, name, position FROM units WHERE id=?1", [id], |r| {
-            Ok(Unit { id: r.get(0)?, name: r.get(1)?, position: r.get(2)? })
-        })
+        .query_row(
+            "SELECT id, name, position FROM units WHERE id=?1",
+            [id],
+            |r| {
+                Ok(Unit {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    position: r.get(2)?,
+                })
+            },
+        )
         .optional()?)
 }
 
 pub fn create_unit(conn: &Connection, name: &str) -> Result<Unit> {
     let name = clean_name(name)?;
-    let pos: i64 = conn.query_row("SELECT COALESCE(MAX(position),0)+1 FROM units", [], |r| r.get(0))?;
+    let pos: i64 = conn.query_row("SELECT COALESCE(MAX(position),0)+1 FROM units", [], |r| {
+        r.get(0)
+    })?;
     conn.execute(
         "INSERT INTO units(name, position, created_at) VALUES (?1, ?2, ?3)",
         params![name, pos, now()],
     )?;
-    Ok(Unit { id: conn.last_insert_rowid(), name, position: pos })
+    Ok(Unit {
+        id: conn.last_insert_rowid(),
+        name,
+        position: pos,
+    })
 }
 
 pub fn rename_unit(conn: &Connection, id: i64, name: &str) -> Result<Option<Unit>> {
@@ -61,16 +79,30 @@ pub fn list_lessons(conn: &Connection) -> Result<Vec<Lesson>> {
          ORDER BY u.position, u.id, l.position, l.id",
     )?;
     let rows = st.query_map([], |r| {
-        Ok(Lesson { id: r.get(0)?, unit_id: r.get(1)?, name: r.get(2)?, position: r.get(3)? })
+        Ok(Lesson {
+            id: r.get(0)?,
+            unit_id: r.get(1)?,
+            name: r.get(2)?,
+            position: r.get(3)?,
+        })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
 pub fn get_lesson(conn: &Connection, id: i64) -> Result<Option<Lesson>> {
     Ok(conn
-        .query_row("SELECT id, unit_id, name, position FROM lessons WHERE id=?1", [id], |r| {
-            Ok(Lesson { id: r.get(0)?, unit_id: r.get(1)?, name: r.get(2)?, position: r.get(3)? })
-        })
+        .query_row(
+            "SELECT id, unit_id, name, position FROM lessons WHERE id=?1",
+            [id],
+            |r| {
+                Ok(Lesson {
+                    id: r.get(0)?,
+                    unit_id: r.get(1)?,
+                    name: r.get(2)?,
+                    position: r.get(3)?,
+                })
+            },
+        )
         .optional()?)
 }
 
@@ -88,7 +120,12 @@ pub fn create_lesson(conn: &Connection, unit_id: i64, name: &str) -> Result<Less
         "INSERT INTO lessons(unit_id, name, position, created_at) VALUES (?1, ?2, ?3, ?4)",
         params![unit_id, name, pos, now()],
     )?;
-    Ok(Lesson { id: conn.last_insert_rowid(), unit_id, name, position: pos })
+    Ok(Lesson {
+        id: conn.last_insert_rowid(),
+        unit_id,
+        name,
+        position: pos,
+    })
 }
 
 pub fn update_lesson(
@@ -97,7 +134,9 @@ pub fn update_lesson(
     name: Option<&str>,
     unit_id: Option<i64>,
 ) -> Result<Option<Lesson>> {
-    let Some(mut lesson) = get_lesson(conn, id)? else { return Ok(None) };
+    let Some(mut lesson) = get_lesson(conn, id)? else {
+        return Ok(None);
+    };
     if let Some(n) = name {
         lesson.name = clean_name(n)?;
     }
@@ -176,7 +215,13 @@ pub fn overview(conn: &Connection) -> Result<Overview> {
     let mut total = Counts::default();
     let mut unit_views: Vec<UnitOverview> = units
         .into_iter()
-        .map(|u| UnitOverview { id: u.id, name: u.name, position: u.position, counts: Counts::default(), lessons: vec![] })
+        .map(|u| UnitOverview {
+            id: u.id,
+            name: u.name,
+            position: u.position,
+            counts: Counts::default(),
+            lessons: vec![],
+        })
         .collect();
     for l in lessons {
         add_counts(&mut total, &l.counts);
@@ -187,7 +232,9 @@ pub fn overview(conn: &Connection) -> Result<Overview> {
     }
 
     let (new_studied_today, reviews_today) = today_stats(conn, now_ts)?;
-    let new_available = (settings.new_per_day - new_studied_today).max(0).min(total.new);
+    let new_available = (settings.new_per_day - new_studied_today)
+        .max(0)
+        .min(total.new);
 
     Ok(Overview {
         now: now_ts,
@@ -279,7 +326,11 @@ pub fn list_cards(conn: &Connection, f: &CardFilter) -> Result<Vec<Card>> {
     }
     // Free-text search is done in Rust: SQLite's lower() is ASCII-only, so
     // "ESTÁ" would not match "está" in SQL. Card counts are small (hundreds).
-    let needle = f.q.as_deref().map(str::trim).filter(|q| !q.is_empty()).map(|q| q.to_lowercase());
+    let needle =
+        f.q.as_deref()
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+            .map(|q| q.to_lowercase());
     if let Some(s) = f.status.as_deref() {
         let mut with_now = |tmpl: &str| {
             args.push(Box::new(now_ts));
@@ -307,14 +358,19 @@ pub fn list_cards(conn: &Connection, f: &CardFilter) -> Result<Vec<Card>> {
     let limit = f.limit.unwrap_or(2000).clamp(1, 10_000) as usize;
 
     let mut st = conn.prepare(&sql)?;
-    let rows = st.query_map(params_from_iter(args.iter().map(|a| a.as_ref())), |r| row_to_card(r, now_ts))?;
+    let rows = st.query_map(params_from_iter(args.iter().map(|a| a.as_ref())), |r| {
+        row_to_card(r, now_ts)
+    })?;
     let mut out = Vec::new();
     for row in rows {
         let c = row?;
         if let Some(n) = &needle {
             let hit = c.front.to_lowercase().contains(n.as_str())
                 || c.back.to_lowercase().contains(n.as_str())
-                || c.example.as_deref().map(|e| e.to_lowercase().contains(n.as_str())).unwrap_or(false);
+                || c.example
+                    .as_deref()
+                    .map(|e| e.to_lowercase().contains(n.as_str()))
+                    .unwrap_or(false);
             if !hit {
                 continue;
             }
@@ -330,7 +386,9 @@ pub fn list_cards(conn: &Connection, f: &CardFilter) -> Result<Vec<Card>> {
 pub fn get_card(conn: &Connection, id: i64) -> Result<Option<Card>> {
     let now_ts = now();
     let sql = format!("{CARD_SELECT} WHERE c.id = ?1");
-    Ok(conn.query_row(&sql, [id], |r| row_to_card(r, now_ts)).optional()?)
+    Ok(conn
+        .query_row(&sql, [id], |r| row_to_card(r, now_ts))
+        .optional()?)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -348,9 +406,16 @@ fn clean_card(c: &NewCard) -> Result<(String, String, Option<String>)> {
         return Err(anyhow!("both sides of a card are required"));
     }
     if front.chars().count() > 500 || back.chars().count() > 500 {
-        return Err(anyhow!("card text is too long (max 500 characters per side)"));
+        return Err(anyhow!(
+            "card text is too long (max 500 characters per side)"
+        ));
     }
-    let example = c.example.as_deref().map(str::trim).filter(|e| !e.is_empty()).map(|e| e.chars().take(1000).collect());
+    let example = c
+        .example
+        .as_deref()
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(|e| e.chars().take(1000).collect());
     Ok((front.to_string(), back.to_string(), example))
 }
 
@@ -376,7 +441,17 @@ pub fn create_cards(conn: &Connection, lesson_id: i64, cards: &[NewCard]) -> Res
         )?;
         // Rowids are monotonic, so (created_at, id) ordering preserves input order.
         for (front, back, example) in &cleaned {
-            st.execute(params![lesson_id, front, back, example, srs.state, srs.due, srs.interval_days, srs.ease, ts])?;
+            st.execute(params![
+                lesson_id,
+                front,
+                back,
+                example,
+                srs.state,
+                srs.due,
+                srs.interval_days,
+                srs.ease,
+                ts
+            ])?;
             ids.push(tx.last_insert_rowid());
         }
     }
@@ -398,7 +473,9 @@ pub struct CardPatch {
 }
 
 pub fn update_card(conn: &Connection, id: i64, p: &CardPatch) -> Result<Option<Card>> {
-    let Some(cur) = get_card(conn, id)? else { return Ok(None) };
+    let Some(cur) = get_card(conn, id)? else {
+        return Ok(None);
+    };
     let nc = NewCard {
         front: p.front.clone().unwrap_or(cur.front),
         back: p.back.clone().unwrap_or(cur.back),
@@ -431,15 +508,58 @@ pub fn delete_card(conn: &Connection, id: i64) -> Result<bool> {
     Ok(conn.execute("DELETE FROM cards WHERE id=?1", [id])? > 0)
 }
 
+pub fn update_cards_bulk(conn: &Connection, updates: &[BulkCardUpdate]) -> Result<usize> {
+    if updates.is_empty() {
+        return Ok(0);
+    }
+    if updates.len() > 500 {
+        return Err(anyhow!("too many updates in one request (max 500)"));
+    }
+    let cleaned: Vec<(i64, String, String, Option<String>)> = updates
+        .iter()
+        .map(|u| {
+            let (front, back, example) = clean_card(&NewCard {
+                front: u.front.clone(),
+                back: u.back.clone(),
+                example: u.example.clone(),
+            })?;
+            Ok((u.id, front, back, example))
+        })
+        .collect::<Result<_>>()?;
+
+    let ts = now();
+    let tx = conn.unchecked_transaction()?;
+    let mut rows_affected = 0usize;
+    {
+        let mut st = tx
+            .prepare("UPDATE cards SET front=?1, back=?2, example=?3, updated_at=?4 WHERE id=?5")?;
+        for (id, front, back, example) in cleaned {
+            rows_affected += st.execute(params![front, back, example, ts, id])?;
+        }
+    }
+    tx.commit()?;
+    Ok(rows_affected)
+}
+
 /// Normalised front text used for duplicate detection.
 pub fn normalize_front(s: &str) -> String {
-    s.trim().to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+    s.trim()
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Map from normalised front → (card id, "lesson name") for duplicate hints.
 pub fn existing_fronts(conn: &Connection) -> Result<HashMap<String, (i64, String)>> {
     let mut st = conn.prepare("SELECT c.id, c.front, l.name FROM cards c JOIN lessons l ON l.id=c.lesson_id ORDER BY c.id")?;
-    let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+    let rows = st.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
     let mut map = HashMap::new();
     for row in rows {
         let (id, front, lesson) = row?;
@@ -470,7 +590,11 @@ pub fn clean_theme(t: &str) -> Result<String> {
 }
 
 fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>> {
-    Ok(conn.query_row("SELECT value FROM settings WHERE key=?1", [key], |r| r.get(0)).optional()?)
+    Ok(conn
+        .query_row("SELECT value FROM settings WHERE key=?1", [key], |r| {
+            r.get(0)
+        })
+        .optional()?)
 }
 
 fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
@@ -481,7 +605,6 @@ fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-
 /// Persisted settings. `gemini_model` / `gemini_api_key_set` are placeholders
 /// here – the route fills them from the server environment.
 pub fn get_settings(conn: &Connection) -> Result<Settings> {
@@ -489,9 +612,14 @@ pub fn get_settings(conn: &Connection) -> Result<Settings> {
     Ok(Settings {
         front_lang: get_setting(conn, "front_lang")?.unwrap_or_else(|| "Español".into()),
         back_lang: get_setting(conn, "back_lang")?.unwrap_or_else(|| "Polski".into()),
-        study_direction: get_setting(conn, "study_direction")?.unwrap_or_else(|| "front_to_back".into()),
-        new_per_day: get_setting(conn, "new_per_day")?.and_then(|v| v.parse().ok()).unwrap_or(15),
-        haptics: get_setting(conn, "haptics")?.map(|v| v == "true").unwrap_or(true),
+        study_direction: get_setting(conn, "study_direction")?
+            .unwrap_or_else(|| "front_to_back".into()),
+        new_per_day: get_setting(conn, "new_per_day")?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(15),
+        haptics: get_setting(conn, "haptics")?
+            .map(|v| v == "true")
+            .unwrap_or(true),
         gemini_model: String::new(),
         gemini_api_key_set: false,
         last_lesson_id: get_setting(conn, "last_lesson_id")?.and_then(|v| v.parse().ok()),
@@ -499,7 +627,9 @@ pub fn get_settings(conn: &Connection) -> Result<Settings> {
         extractions_today: usage.today,
         extractions_total: usage.total,
         extract_daily_cap: 0,
-        theme: get_setting(conn, "theme")?.and_then(|t| clean_theme(&t).ok()).unwrap_or_else(|| DEFAULT_THEME.into()),
+        theme: get_setting(conn, "theme")?
+            .and_then(|t| clean_theme(&t).ok())
+            .unwrap_or_else(|| DEFAULT_THEME.into()),
     })
 }
 
@@ -519,7 +649,9 @@ pub fn patch_settings(conn: &Connection, p: &SettingsPatch) -> Result<Settings> 
     }
     if let Some(v) = &p.study_direction {
         if !matches!(v.as_str(), "front_to_back" | "back_to_front" | "mixed") {
-            return Err(anyhow!("study_direction must be front_to_back, back_to_front or mixed"));
+            return Err(anyhow!(
+                "study_direction must be front_to_back, back_to_front or mixed"
+            ));
         }
         set_setting(conn, "study_direction", v)?;
     }
@@ -555,15 +687,21 @@ pub struct ExtractionUsage {
 }
 
 pub fn extraction_paused(conn: &Connection) -> Result<bool> {
-    Ok(get_setting(conn, "extraction_paused")?.map(|v| v == "true").unwrap_or(false))
+    Ok(get_setting(conn, "extraction_paused")?
+        .map(|v| v == "true")
+        .unwrap_or(false))
 }
 
 /// Attempts started today (local day containing `now_ts`) and overall.
 pub fn extraction_usage(conn: &Connection, now_ts: i64) -> Result<ExtractionUsage> {
-    let total = get_setting(conn, "extract_total")?.and_then(|v| v.parse().ok()).unwrap_or(0);
+    let total = get_setting(conn, "extract_total")?
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let day = get_setting(conn, "extract_day")?.and_then(|v| v.parse::<i64>().ok());
     let today = if day == Some(start_of_local_day(now_ts)) {
-        get_setting(conn, "extract_today")?.and_then(|v| v.parse().ok()).unwrap_or(0)
+        get_setting(conn, "extract_today")?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
     } else {
         0
     };
@@ -573,7 +711,10 @@ pub fn extraction_usage(conn: &Connection, now_ts: i64) -> Result<ExtractionUsag
 /// Count one attempt (called before the Gemini request so failures count too).
 pub fn record_extraction(conn: &Connection, now_ts: i64) -> Result<ExtractionUsage> {
     let cur = extraction_usage(conn, now_ts)?;
-    let next = ExtractionUsage { today: cur.today + 1, total: cur.total + 1 };
+    let next = ExtractionUsage {
+        today: cur.today + 1,
+        total: cur.total + 1,
+    };
     let tx = conn.unchecked_transaction()?;
     set_setting(&tx, "extract_day", &start_of_local_day(now_ts).to_string())?;
     set_setting(&tx, "extract_today", &next.today.to_string())?;
@@ -607,13 +748,20 @@ pub fn study_queue(conn: &Connection, req: &QueueRequest) -> Result<Vec<StudyIte
     let mut cards: Vec<Card> = Vec::new();
     if let Some(ids) = req.ids.as_deref().filter(|s| !s.trim().is_empty()) {
         for id in ids.split(',') {
-            let id: i64 = id.trim().parse().map_err(|_| anyhow!("bad card id '{id}'"))?;
+            let id: i64 = id
+                .trim()
+                .parse()
+                .map_err(|_| anyhow!("bad card id '{id}'"))?;
             if let Some(c) = get_card(conn, id)? {
                 cards.push(c);
             }
         }
     } else {
-        let mut filter = CardFilter { sort: Some("due".into()), limit: Some(10_000), ..Default::default() };
+        let mut filter = CardFilter {
+            sort: Some("due".into()),
+            limit: Some(10_000),
+            ..Default::default()
+        };
         match req.scope.as_deref().unwrap_or("all") {
             "all" | "" => {}
             s if s.starts_with("lesson:") => filter.lesson_id = Some(parse_scope_id(s)?),
@@ -623,11 +771,18 @@ pub fn study_queue(conn: &Connection, req: &QueueRequest) -> Result<Vec<StudyIte
         let all = list_cards(conn, &filter)?;
         let mode = req.mode.as_deref().unwrap_or("due");
         let (new_studied_today, _) = today_stats(conn, now_ts)?;
-        let mut new_budget = if mode == "all" { usize::MAX } else { (settings.new_per_day - new_studied_today).max(0) as usize };
+        let mut new_budget = if mode == "all" {
+            usize::MAX
+        } else {
+            (settings.new_per_day - new_studied_today).max(0) as usize
+        };
 
-        let (due, rest): (Vec<Card>, Vec<Card>) = all.into_iter().partition(|c| c.state != STATE_NEW && c.due <= now_ts);
+        let (due, rest): (Vec<Card>, Vec<Card>) = all
+            .into_iter()
+            .partition(|c| c.state != STATE_NEW && c.due <= now_ts);
         cards.extend(due);
-        let (new, later): (Vec<Card>, Vec<Card>) = rest.into_iter().partition(|c| c.state == STATE_NEW);
+        let (new, later): (Vec<Card>, Vec<Card>) =
+            rest.into_iter().partition(|c| c.state == STATE_NEW);
         let mut new = new;
         new.sort_by_key(|c| (c.created_at, c.id));
         for c in new {
@@ -656,7 +811,11 @@ pub fn study_queue(conn: &Connection, req: &QueueRequest) -> Result<Vec<StudyIte
             let s = card_srs(&card);
             let preview = srs::preview(&s, now_ts);
             // "mixed": cheap deterministic-per-session pseudo randomness.
-            let mixed_reverse = (card.id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(now_ts as u64 ^ i as u64) >> 63 == 1;
+            let mixed_reverse = (card.id as u64)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(now_ts as u64 ^ i as u64)
+                >> 63
+                == 1;
             let direction = match direction_setting.as_str() {
                 "back_to_front" => "reverse",
                 "mixed" if mixed_reverse => "reverse",
@@ -695,7 +854,12 @@ impl SessionRng {
     pub fn new() -> Self {
         use std::hash::{BuildHasher, Hasher};
         let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-        h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+        h.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        );
         Self::seeded(h.finish())
     }
 
@@ -750,8 +914,15 @@ fn card_srs(c: &Card) -> SrsState {
     }
 }
 
-pub fn apply_review(conn: &Connection, card_id: i64, grade: Grade, direction: Option<&str>) -> Result<Option<ReviewResult>> {
-    let Some(card) = get_card(conn, card_id)? else { return Ok(None) };
+pub fn apply_review(
+    conn: &Connection,
+    card_id: i64,
+    grade: Grade,
+    direction: Option<&str>,
+) -> Result<Option<ReviewResult>> {
+    let Some(card) = get_card(conn, card_id)? else {
+        return Ok(None);
+    };
     let now_ts = now();
     let before = card_srs(&card);
     let after = srs::schedule(&before, grade, now_ts);
@@ -776,7 +947,13 @@ pub fn apply_review(conn: &Connection, card_id: i64, grade: Grade, direction: Op
         good: srs::human_interval(preview.good),
         easy: srs::human_interval(preview.easy),
     };
-    Ok(Some(ReviewResult { card, due_in_secs, due_label: srs::human_interval(due_in_secs), preview, preview_labels }))
+    Ok(Some(ReviewResult {
+        card,
+        due_in_secs,
+        due_label: srs::human_interval(due_in_secs),
+        preview,
+        preview_labels,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -831,7 +1008,14 @@ fn default_ease() -> f64 {
 pub fn export(conn: &Connection) -> Result<Backup> {
     let units = list_units(conn)?;
     let lessons = list_lessons(conn)?;
-    let cards = list_cards(conn, &CardFilter { sort: Some("alpha".into()), limit: Some(10_000), ..Default::default() })?;
+    let cards = list_cards(
+        conn,
+        &CardFilter {
+            sort: Some("alpha".into()),
+            limit: Some(10_000),
+            ..Default::default()
+        },
+    )?;
     let out = units
         .into_iter()
         .map(|u| BackupUnit {
@@ -861,7 +1045,11 @@ pub fn export(conn: &Connection) -> Result<Backup> {
             name: u.name,
         })
         .collect();
-    Ok(Backup { version: 1, exported_at: now(), units: out })
+    Ok(Backup {
+        version: 1,
+        exported_at: now(),
+        units: out,
+    })
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -880,7 +1068,9 @@ pub fn import(conn: &Connection, b: &Backup) -> Result<ImportReport> {
     let ts = now();
     for bu in &b.units {
         let unit_id = match tx
-            .query_row("SELECT id FROM units WHERE name=?1", [&bu.name], |r| r.get::<_, i64>(0))
+            .query_row("SELECT id FROM units WHERE name=?1", [&bu.name], |r| {
+                r.get::<_, i64>(0)
+            })
             .optional()?
         {
             Some(id) => id,
@@ -891,7 +1081,11 @@ pub fn import(conn: &Connection, b: &Backup) -> Result<ImportReport> {
         };
         for bl in &bu.lessons {
             let lesson_id = match tx
-                .query_row("SELECT id FROM lessons WHERE unit_id=?1 AND name=?2", params![unit_id, &bl.name], |r| r.get::<_, i64>(0))
+                .query_row(
+                    "SELECT id FROM lessons WHERE unit_id=?1 AND name=?2",
+                    params![unit_id, &bl.name],
+                    |r| r.get::<_, i64>(0),
+                )
                 .optional()?
             {
                 Some(id) => id,
@@ -901,7 +1095,11 @@ pub fn import(conn: &Connection, b: &Backup) -> Result<ImportReport> {
                 }
             };
             for bc in &bl.cards {
-                let nc = NewCard { front: bc.front.clone(), back: bc.back.clone(), example: bc.example.clone() };
+                let nc = NewCard {
+                    front: bc.front.clone(),
+                    back: bc.back.clone(),
+                    example: bc.example.clone(),
+                };
                 let Ok((front, back, example)) = clean_card(&nc) else {
                     rep.cards_skipped += 1;
                     continue;
@@ -917,7 +1115,11 @@ pub fn import(conn: &Connection, b: &Backup) -> Result<ImportReport> {
                     rep.cards_skipped += 1;
                     continue;
                 }
-                let due = if bc.state == STATE_NEW || bc.due == 0 { ts } else { bc.due };
+                let due = if bc.state == STATE_NEW || bc.due == 0 {
+                    ts
+                } else {
+                    bc.due
+                };
                 tx.execute(
                     "INSERT INTO cards(lesson_id, front, back, example, state, due, interval_days, ease, reps, lapses, last_review, created_at, updated_at)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12)",
@@ -953,13 +1155,26 @@ mod tests {
         let (u, l1, _l2) = seed(&c);
         assert_eq!(list_units(&c).unwrap().len(), 1);
         assert_eq!(list_lessons(&c).unwrap().len(), 2);
-        create_card(&c, l1.id, &NewCard { front: "hola".into(), back: "cześć".into(), example: None }).unwrap();
+        create_card(
+            &c,
+            l1.id,
+            &NewCard {
+                front: "hola".into(),
+                back: "cześć".into(),
+                example: None,
+            },
+        )
+        .unwrap();
         assert!(rename_unit(&c, u.id, "  Unidad 1  ").unwrap().unwrap().name == "Unidad 1");
         assert!(create_unit(&c, "   ").is_err());
         assert!(create_lesson(&c, 999, "x").is_err());
         assert!(delete_unit(&c, u.id).unwrap());
         assert_eq!(list_lessons(&c).unwrap().len(), 0);
-        assert_eq!(list_cards(&c, &CardFilter::default()).unwrap().len(), 0, "cards cascade with the unit");
+        assert_eq!(
+            list_cards(&c, &CardFilter::default()).unwrap().len(),
+            0,
+            "cards cascade with the unit"
+        );
         assert!(!delete_unit(&c, u.id).unwrap());
     }
 
@@ -971,13 +1186,28 @@ mod tests {
             &c,
             l1.id,
             &[
-                NewCard { front: "la plaza".into(), back: "plac".into(), example: Some("La plaza está en el centro.".into()) },
-                NewCard { front: " el barrio ".into(), back: "dzielnica".into(), example: Some("  ".into()) },
+                NewCard {
+                    front: "la plaza".into(),
+                    back: "plac".into(),
+                    example: Some("La plaza está en el centro.".into()),
+                },
+                NewCard {
+                    front: " el barrio ".into(),
+                    back: "dzielnica".into(),
+                    example: Some("  ".into()),
+                },
             ],
         )
         .unwrap();
         assert_eq!(ids.len(), 2);
-        let all = list_cards(&c, &CardFilter { sort: Some("alpha".into()), ..Default::default() }).unwrap();
+        let all = list_cards(
+            &c,
+            &CardFilter {
+                sort: Some("alpha".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].front, "el barrio", "trimmed");
         assert_eq!(all[0].example, None, "blank example becomes NULL");
@@ -985,27 +1215,141 @@ mod tests {
         assert_eq!(all[0].lesson_name, "1.1 Saludos");
 
         // Search is case-insensitive and crosses both sides.
-        assert_eq!(list_cards(&c, &CardFilter { q: Some("PLAC".into()), ..Default::default() }).unwrap().len(), 1);
-        assert_eq!(list_cards(&c, &CardFilter { q: Some("centro".into()), ..Default::default() }).unwrap().len(), 1);
-        assert_eq!(list_cards(&c, &CardFilter { q: Some("ESTÁ".into()), ..Default::default() }).unwrap().len(), 1, "unicode case-insensitive");
-        assert_eq!(list_cards(&c, &CardFilter { q: Some("zzz".into()), ..Default::default() }).unwrap().len(), 0);
-        assert_eq!(list_cards(&c, &CardFilter { lesson_id: Some(l2.id), ..Default::default() }).unwrap().len(), 0);
-        assert_eq!(list_cards(&c, &CardFilter { status: Some("new".into()), ..Default::default() }).unwrap().len(), 2);
-        assert_eq!(list_cards(&c, &CardFilter { status: Some("due".into()), ..Default::default() }).unwrap().len(), 0);
-        assert!(list_cards(&c, &CardFilter { status: Some("bogus".into()), ..Default::default() }).is_err());
+        assert_eq!(
+            list_cards(
+                &c,
+                &CardFilter {
+                    q: Some("PLAC".into()),
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        assert_eq!(
+            list_cards(
+                &c,
+                &CardFilter {
+                    q: Some("centro".into()),
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        assert_eq!(
+            list_cards(
+                &c,
+                &CardFilter {
+                    q: Some("ESTÁ".into()),
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .len(),
+            1,
+            "unicode case-insensitive"
+        );
+        assert_eq!(
+            list_cards(
+                &c,
+                &CardFilter {
+                    q: Some("zzz".into()),
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .len(),
+            0
+        );
+        assert_eq!(
+            list_cards(
+                &c,
+                &CardFilter {
+                    lesson_id: Some(l2.id),
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .len(),
+            0
+        );
+        assert_eq!(
+            list_cards(
+                &c,
+                &CardFilter {
+                    status: Some("new".into()),
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .len(),
+            2
+        );
+        assert_eq!(
+            list_cards(
+                &c,
+                &CardFilter {
+                    status: Some("due".into()),
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .len(),
+            0
+        );
+        assert!(list_cards(
+            &c,
+            &CardFilter {
+                status: Some("bogus".into()),
+                ..Default::default()
+            }
+        )
+        .is_err());
 
         // Validation.
-        assert!(create_card(&c, l1.id, &NewCard { front: "".into(), back: "x".into(), example: None }).is_err());
-        assert!(create_card(&c, 999, &NewCard { front: "a".into(), back: "b".into(), example: None }).is_err());
+        assert!(create_card(
+            &c,
+            l1.id,
+            &NewCard {
+                front: "".into(),
+                back: "x".into(),
+                example: None
+            }
+        )
+        .is_err());
+        assert!(create_card(
+            &c,
+            999,
+            &NewCard {
+                front: "a".into(),
+                back: "b".into(),
+                example: None
+            }
+        )
+        .is_err());
 
         // Update + move + clear example.
-        let upd = update_card(&c, ids[0], &CardPatch { back: Some("plac (miejski)".into()), lesson_id: Some(l2.id), example: Some("".into()), ..Default::default() })
-            .unwrap()
-            .unwrap();
+        let upd = update_card(
+            &c,
+            ids[0],
+            &CardPatch {
+                back: Some("plac (miejski)".into()),
+                lesson_id: Some(l2.id),
+                example: Some("".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(upd.back, "plac (miejski)");
         assert_eq!(upd.lesson_id, l2.id);
         assert_eq!(upd.example, None);
-        assert!(update_card(&c, 12345, &CardPatch::default()).unwrap().is_none());
+        assert!(update_card(&c, 12345, &CardPatch::default())
+            .unwrap()
+            .is_none());
 
         assert!(delete_card(&c, ids[1]).unwrap());
         assert!(!delete_card(&c, ids[1]).unwrap());
@@ -1019,9 +1363,36 @@ mod tests {
     fn overview_counts_and_new_budget() {
         let c = conn();
         let (u, l1, l2) = seed(&c);
-        create_cards(&c, l1.id, &(0..5).map(|i| NewCard { front: format!("w{i}"), back: "x".into(), example: None }).collect::<Vec<_>>()).unwrap();
-        create_cards(&c, l2.id, &[NewCard { front: "uno".into(), back: "jeden".into(), example: None }]).unwrap();
-        patch_settings(&c, &SettingsPatch { new_per_day: Some(3), ..Default::default() }).unwrap();
+        create_cards(
+            &c,
+            l1.id,
+            &(0..5)
+                .map(|i| NewCard {
+                    front: format!("w{i}"),
+                    back: "x".into(),
+                    example: None,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        create_cards(
+            &c,
+            l2.id,
+            &[NewCard {
+                front: "uno".into(),
+                back: "jeden".into(),
+                example: None,
+            }],
+        )
+        .unwrap();
+        patch_settings(
+            &c,
+            &SettingsPatch {
+                new_per_day: Some(3),
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
         let o = overview(&c).unwrap();
         assert_eq!(o.counts.total, 6);
@@ -1034,8 +1405,19 @@ mod tests {
         assert_eq!(o.units[0].lessons[0].counts.total, 5);
 
         // Review one new card: it leaves "new", new_available shrinks.
-        let first = list_cards(&c, &CardFilter { lesson_id: Some(l1.id), sort: Some("alpha".into()), ..Default::default() }).unwrap()[0].id;
-        let r = apply_review(&c, first, Grade::Good, Some("forward")).unwrap().unwrap();
+        let first = list_cards(
+            &c,
+            &CardFilter {
+                lesson_id: Some(l1.id),
+                sort: Some("alpha".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap()[0]
+            .id;
+        let r = apply_review(&c, first, Grade::Good, Some("forward"))
+            .unwrap()
+            .unwrap();
         assert_eq!(r.card.status, "learned");
         assert_eq!(r.due_label, "1 day");
         let o = overview(&c).unwrap();
@@ -1046,7 +1428,9 @@ mod tests {
         assert_eq!(o.new_available, 2);
 
         // Again keeps it in learning and due within a minute.
-        let r = apply_review(&c, first, Grade::Again, None).unwrap().unwrap();
+        let r = apply_review(&c, first, Grade::Again, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(r.card.status, "learning");
         assert!(r.due_in_secs <= 600);
         assert!(apply_review(&c, 999, Grade::Good, None).unwrap().is_none());
@@ -1056,9 +1440,38 @@ mod tests {
     fn study_queue_respects_scope_budget_and_ids() {
         let c = conn();
         let (u, l1, l2) = seed(&c);
-        create_cards(&c, l1.id, &(0..4).map(|i| NewCard { front: format!("a{i}"), back: "x".into(), example: None }).collect::<Vec<_>>()).unwrap();
-        create_cards(&c, l2.id, &(0..4).map(|i| NewCard { front: format!("b{i}"), back: "x".into(), example: None }).collect::<Vec<_>>()).unwrap();
-        patch_settings(&c, &SettingsPatch { new_per_day: Some(5), ..Default::default() }).unwrap();
+        create_cards(
+            &c,
+            l1.id,
+            &(0..4)
+                .map(|i| NewCard {
+                    front: format!("a{i}"),
+                    back: "x".into(),
+                    example: None,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        create_cards(
+            &c,
+            l2.id,
+            &(0..4)
+                .map(|i| NewCard {
+                    front: format!("b{i}"),
+                    back: "x".into(),
+                    example: None,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        patch_settings(
+            &c,
+            &SettingsPatch {
+                new_per_day: Some(5),
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
         let q = study_queue(&c, &QueueRequest::default()).unwrap();
         assert_eq!(q.len(), 5, "new cards capped by daily budget");
@@ -1066,30 +1479,76 @@ mod tests {
         assert_eq!(q[0].preview_labels.good, "1 day");
         assert_eq!(q[0].preview_labels.easy, "4 days");
 
-        let q = study_queue(&c, &QueueRequest { scope: Some(format!("lesson:{}", l2.id)), ..Default::default() }).unwrap();
+        let q = study_queue(
+            &c,
+            &QueueRequest {
+                scope: Some(format!("lesson:{}", l2.id)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(q.len(), 4);
         assert!(q.iter().all(|i| i.card.lesson_id == l2.id));
 
-        let q = study_queue(&c, &QueueRequest { scope: Some(format!("unit:{}", u.id)), mode: Some("all".into()), ..Default::default() }).unwrap();
+        let q = study_queue(
+            &c,
+            &QueueRequest {
+                scope: Some(format!("unit:{}", u.id)),
+                mode: Some("all".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(q.len(), 8, "mode=all ignores the budget");
 
         // Make one card due in the past: it is always part of the queue (position is random).
         let target = q[7].card.id;
-        c.execute("UPDATE cards SET state=2, due=0, interval_days=3 WHERE id=?1", [target]).unwrap();
+        c.execute(
+            "UPDATE cards SET state=2, due=0, interval_days=3 WHERE id=?1",
+            [target],
+        )
+        .unwrap();
         let q = study_queue(&c, &QueueRequest::default()).unwrap();
-        let due_item = q.iter().find(|i| i.card.id == target).expect("due card is in the queue");
+        let due_item = q
+            .iter()
+            .find(|i| i.card.id == target)
+            .expect("due card is in the queue");
         assert_eq!(due_item.card.status, "due");
         assert_eq!(q.len(), 6, "1 due + 5 new");
 
         // Explicit ids keep the given order.
         let ids = format!("{},{},{}", q[2].card.id, q[1].card.id, 99999);
-        let q2 = study_queue(&c, &QueueRequest { ids: Some(ids), ..Default::default() }).unwrap();
-        assert_eq!(q2.iter().map(|i| i.card.id).collect::<Vec<_>>(), vec![q[2].card.id, q[1].card.id]);
+        let q2 = study_queue(
+            &c,
+            &QueueRequest {
+                ids: Some(ids),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            q2.iter().map(|i| i.card.id).collect::<Vec<_>>(),
+            vec![q[2].card.id, q[1].card.id]
+        );
 
         // Direction override.
-        let q3 = study_queue(&c, &QueueRequest { direction: Some("back_to_front".into()), ..Default::default() }).unwrap();
+        let q3 = study_queue(
+            &c,
+            &QueueRequest {
+                direction: Some("back_to_front".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(q3.iter().all(|i| i.direction == "reverse"));
-        assert!(study_queue(&c, &QueueRequest { scope: Some("galaxy:1".into()), ..Default::default() }).is_err());
+        assert!(study_queue(
+            &c,
+            &QueueRequest {
+                scope: Some("galaxy:1".into()),
+                ..Default::default()
+            }
+        )
+        .is_err());
     }
 
     #[test]
@@ -1108,7 +1567,10 @@ mod tests {
         let mut sorted = a.clone();
         sorted.sort();
         assert_eq!(sorted, base, "shuffle keeps every element exactly once");
-        assert_ne!(a, base, "50 elements practically never come back in identity order");
+        assert_ne!(
+            a, base,
+            "50 elements practically never come back in identity order"
+        );
 
         let mut b = base.clone();
         shuffle(&mut b, &mut SessionRng::seeded(7));
@@ -1137,13 +1599,41 @@ mod tests {
         let c = conn();
         let (_u, l1, _) = seed(&c);
         // 12 cards; mark 4 of them due so the queue mixes due + new.
-        let ids = create_cards(&c, l1.id, &(0..12).map(|i| NewCard { front: format!("w{i}"), back: "x".into(), example: None }).collect::<Vec<_>>()).unwrap();
+        let ids = create_cards(
+            &c,
+            l1.id,
+            &(0..12)
+                .map(|i| NewCard {
+                    front: format!("w{i}"),
+                    back: "x".into(),
+                    example: None,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
         for id in &ids[..4] {
-            c.execute("UPDATE cards SET state=2, due=0, interval_days=3 WHERE id=?1", [id]).unwrap();
+            c.execute(
+                "UPDATE cards SET state=2, due=0, interval_days=3 WHERE id=?1",
+                [id],
+            )
+            .unwrap();
         }
-        patch_settings(&c, &SettingsPatch { new_per_day: Some(8), ..Default::default() }).unwrap();
+        patch_settings(
+            &c,
+            &SettingsPatch {
+                new_per_day: Some(8),
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
-        let order = |req: &QueueRequest| study_queue(&c, req).unwrap().iter().map(|i| i.card.id).collect::<Vec<_>>();
+        let order = |req: &QueueRequest| {
+            study_queue(&c, req)
+                .unwrap()
+                .iter()
+                .map(|i| i.card.id)
+                .collect::<Vec<_>>()
+        };
         let mut expected: Vec<i64> = ids.clone();
         expected.sort();
 
@@ -1155,43 +1645,82 @@ mod tests {
 
         // Probability that 6 fresh draws all reproduce `first` is ~(1/12!)^6.
         let differs = (0..6).any(|_| order(&QueueRequest::default()) != first);
-        assert!(differs, "the same cards should come in a different order in another session");
+        assert!(
+            differs,
+            "the same cards should come in a different order in another session"
+        );
 
         // Limit still prefers due cards: with limit=4 only the due ones are served, in some order.
-        let mut limited = order(&QueueRequest { limit: Some(4), ..Default::default() });
+        let mut limited = order(&QueueRequest {
+            limit: Some(4),
+            ..Default::default()
+        });
         limited.sort();
         let mut due_ids: Vec<i64> = ids[..4].to_vec();
         due_ids.sort();
         assert_eq!(limited, due_ids);
 
         // New-card budget: 8 of 8 new cards fit, but with a budget of 3 only the 3 oldest new cards are served.
-        patch_settings(&c, &SettingsPatch { new_per_day: Some(3), ..Default::default() }).unwrap();
+        patch_settings(
+            &c,
+            &SettingsPatch {
+                new_per_day: Some(3),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let mut q = order(&QueueRequest::default());
         q.sort();
         let mut want: Vec<i64> = ids[..7].to_vec(); // 4 due + 3 oldest new (ids are monotonic)
         want.sort();
-        assert_eq!(q, want, "budget still picks the oldest new cards, only the order is random");
+        assert_eq!(
+            q, want,
+            "budget still picks the oldest new cards, only the order is random"
+        );
 
         // Explicit ids are untouched by the server shuffle.
         let explicit = format!("{},{},{}", ids[5], ids[1], ids[9]);
-        assert_eq!(order(&QueueRequest { ids: Some(explicit), ..Default::default() }), vec![ids[5], ids[1], ids[9]]);
+        assert_eq!(
+            order(&QueueRequest {
+                ids: Some(explicit),
+                ..Default::default()
+            }),
+            vec![ids[5], ids[1], ids[9]]
+        );
 
         // mode=all: the served *set* is still carved as due → new → not-yet-due before the shuffle,
         // so a limit never drops a due card in favour of one scheduled far in the future.
         let later = ids[11];
-        c.execute("UPDATE cards SET state=2, due=?1, interval_days=30 WHERE id=?2", [now() + 30 * 86_400, later]).unwrap();
-        let all_req = |limit: Option<i64>| QueueRequest { mode: Some("all".into()), limit, ..Default::default() };
+        c.execute(
+            "UPDATE cards SET state=2, due=?1, interval_days=30 WHERE id=?2",
+            [now() + 30 * 86_400, later],
+        )
+        .unwrap();
+        let all_req = |limit: Option<i64>| QueueRequest {
+            mode: Some("all".into()),
+            limit,
+            ..Default::default()
+        };
         let mut everything = order(&all_req(None));
         everything.sort();
-        assert_eq!(everything, expected, "mode=all ignores the budget and includes the not-yet-due card");
+        assert_eq!(
+            everything, expected,
+            "mode=all ignores the budget and includes the not-yet-due card"
+        );
         let capped = order(&all_req(Some(11)));
         assert_eq!(capped.len(), 11);
-        assert!(!capped.contains(&later), "the not-yet-due card is the first to be cut by the limit");
+        assert!(
+            !capped.contains(&later),
+            "the not-yet-due card is the first to be cut by the limit"
+        );
         let mut capped = order(&all_req(Some(6)));
         capped.sort();
         let mut want: Vec<i64> = ids[..6].to_vec(); // 4 due + 2 oldest new
         want.sort();
-        assert_eq!(capped, want, "limit under mode=all still prefers due, then oldest new");
+        assert_eq!(
+            capped, want,
+            "limit under mode=all still prefers due, then oldest new"
+        );
     }
 
     #[test]
@@ -1202,14 +1731,33 @@ mod tests {
         assert_eq!(s.new_per_day, 15);
         let s = patch_settings(
             &c,
-            &SettingsPatch { front_lang: Some("Polski".into()), back_lang: Some("English".into()), study_direction: Some("mixed".into()), ..Default::default() },
+            &SettingsPatch {
+                front_lang: Some("Polski".into()),
+                back_lang: Some("English".into()),
+                study_direction: Some("mixed".into()),
+                ..Default::default()
+            },
         )
         .unwrap();
         assert_eq!(s.front_lang, "Polski");
         assert_eq!(s.back_lang, "English");
         assert_eq!(s.study_direction, "mixed");
-        assert!(patch_settings(&c, &SettingsPatch { study_direction: Some("sideways".into()), ..Default::default() }).is_err());
-        assert!(patch_settings(&c, &SettingsPatch { new_per_day: Some(-1), ..Default::default() }).is_err());
+        assert!(patch_settings(
+            &c,
+            &SettingsPatch {
+                study_direction: Some("sideways".into()),
+                ..Default::default()
+            }
+        )
+        .is_err());
+        assert!(patch_settings(
+            &c,
+            &SettingsPatch {
+                new_per_day: Some(-1),
+                ..Default::default()
+            }
+        )
+        .is_err());
     }
 
     #[test]
@@ -1217,16 +1765,39 @@ mod tests {
         let c = conn();
         // Rejected with a clear message, and the other fields in the same patch are not applied either.
         for p in [
-            SettingsPatch { gemini_api_key: Some("AIzaSyEXAMPLE1234".into()), front_lang: Some("Deutsch".into()), ..Default::default() },
-            SettingsPatch { gemini_api_key: Some(String::new()), ..Default::default() },
-            SettingsPatch { gemini_model: Some("gemini-2.5-pro".into()), ..Default::default() },
-            SettingsPatch { gemini_model: Some(String::new()), ..Default::default() },
+            SettingsPatch {
+                gemini_api_key: Some("AIzaSyEXAMPLE1234".into()),
+                front_lang: Some("Deutsch".into()),
+                ..Default::default()
+            },
+            SettingsPatch {
+                gemini_api_key: Some(String::new()),
+                ..Default::default()
+            },
+            SettingsPatch {
+                gemini_model: Some("gemini-2.5-pro".into()),
+                ..Default::default()
+            },
+            SettingsPatch {
+                gemini_model: Some(String::new()),
+                ..Default::default()
+            },
         ] {
             let e = patch_settings(&c, &p).unwrap_err().to_string();
             assert_eq!(e, SERVER_ONLY_SETTING_MSG);
         }
-        assert_eq!(get_settings(&c).unwrap().front_lang, "Español", "rejected patch changed nothing");
-        let n: i64 = c.query_row("SELECT count(*) FROM settings WHERE key IN ('gemini_api_key','gemini_model')", [], |r| r.get(0)).unwrap();
+        assert_eq!(
+            get_settings(&c).unwrap().front_lang,
+            "Español",
+            "rejected patch changed nothing"
+        );
+        let n: i64 = c
+            .query_row(
+                "SELECT count(*) FROM settings WHERE key IN ('gemini_api_key','gemini_model')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(n, 0, "nothing key/model-related is ever written");
     }
 
@@ -1240,25 +1811,72 @@ mod tests {
         set_setting(&c, "gemini_model", "gemini-old").unwrap();
         set_setting(&c, "theme", "dark").unwrap();
         crate::db::migrate(&c).unwrap();
-        let n: i64 = c.query_row("SELECT count(*) FROM settings WHERE key IN ('gemini_api_key','gemini_model')", [], |r| r.get(0)).unwrap();
+        let n: i64 = c
+            .query_row(
+                "SELECT count(*) FROM settings WHERE key IN ('gemini_api_key','gemini_model')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(n, 0);
-        assert_eq!(get_settings(&c).unwrap().theme, "dark", "other settings survive");
+        assert_eq!(
+            get_settings(&c).unwrap().theme,
+            "dark",
+            "other settings survive"
+        );
     }
 
     #[test]
     fn theme_defaults_to_light_and_is_validated() {
         let c = conn();
-        assert_eq!(get_settings(&c).unwrap().theme, "light", "fresh install must show the Stitch light design");
+        assert_eq!(
+            get_settings(&c).unwrap().theme,
+            "light",
+            "fresh install must show the Stitch light design"
+        );
         for t in THEMES {
-            let s = patch_settings(&c, &SettingsPatch { theme: Some(t.into()), ..Default::default() }).unwrap();
+            let s = patch_settings(
+                &c,
+                &SettingsPatch {
+                    theme: Some(t.into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
             assert_eq!(s.theme, t);
         }
-        let s = patch_settings(&c, &SettingsPatch { theme: Some("  Dark ".into()), ..Default::default() }).unwrap();
+        let s = patch_settings(
+            &c,
+            &SettingsPatch {
+                theme: Some("  Dark ".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(s.theme, "dark", "trimmed and lower-cased");
-        let e = patch_settings(&c, &SettingsPatch { theme: Some("sepia".into()), ..Default::default() }).unwrap_err().to_string();
+        let e = patch_settings(
+            &c,
+            &SettingsPatch {
+                theme: Some("sepia".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
         assert!(e.contains("light, dark, system"), "{e}");
-        assert!(patch_settings(&c, &SettingsPatch { theme: Some("".into()), ..Default::default() }).is_err());
-        assert_eq!(get_settings(&c).unwrap().theme, "dark", "rejected value did not overwrite");
+        assert!(patch_settings(
+            &c,
+            &SettingsPatch {
+                theme: Some("".into()),
+                ..Default::default()
+            }
+        )
+        .is_err());
+        assert_eq!(
+            get_settings(&c).unwrap().theme,
+            "dark",
+            "rejected value did not overwrite"
+        );
         // Garbage written directly to the table (e.g. older build) falls back to the default.
         set_setting(&c, "theme", "neon").unwrap();
         assert_eq!(get_settings(&c).unwrap().theme, DEFAULT_THEME);
@@ -1272,18 +1890,47 @@ mod tests {
         assert_eq!((s.extractions_today, s.extractions_total), (0, 0));
 
         let t = 1_700_000_000;
-        assert_eq!(record_extraction(&c, t).unwrap(), ExtractionUsage { today: 1, total: 1 });
-        assert_eq!(record_extraction(&c, t + 60).unwrap(), ExtractionUsage { today: 2, total: 2 });
-        assert_eq!(extraction_usage(&c, t + 61).unwrap(), ExtractionUsage { today: 2, total: 2 });
+        assert_eq!(
+            record_extraction(&c, t).unwrap(),
+            ExtractionUsage { today: 1, total: 1 }
+        );
+        assert_eq!(
+            record_extraction(&c, t + 60).unwrap(),
+            ExtractionUsage { today: 2, total: 2 }
+        );
+        assert_eq!(
+            extraction_usage(&c, t + 61).unwrap(),
+            ExtractionUsage { today: 2, total: 2 }
+        );
         // Next day: today's counter resets, the total keeps growing.
         let tomorrow = t + 86_400;
-        assert_eq!(extraction_usage(&c, tomorrow).unwrap(), ExtractionUsage { today: 0, total: 2 });
-        assert_eq!(record_extraction(&c, tomorrow).unwrap(), ExtractionUsage { today: 1, total: 3 });
+        assert_eq!(
+            extraction_usage(&c, tomorrow).unwrap(),
+            ExtractionUsage { today: 0, total: 2 }
+        );
+        assert_eq!(
+            record_extraction(&c, tomorrow).unwrap(),
+            ExtractionUsage { today: 1, total: 3 }
+        );
 
-        let s = patch_settings(&c, &SettingsPatch { extraction_paused: Some(true), ..Default::default() }).unwrap();
+        let s = patch_settings(
+            &c,
+            &SettingsPatch {
+                extraction_paused: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(s.extraction_paused);
         assert!(extraction_paused(&c).unwrap());
-        let s = patch_settings(&c, &SettingsPatch { extraction_paused: Some(false), ..Default::default() }).unwrap();
+        let s = patch_settings(
+            &c,
+            &SettingsPatch {
+                extraction_paused: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(!s.extraction_paused);
     }
 
@@ -1291,7 +1938,16 @@ mod tests {
     fn duplicate_detection_normalises_fronts() {
         let c = conn();
         let (_u, l1, _) = seed(&c);
-        create_card(&c, l1.id, &NewCard { front: "El  Paraguas".into(), back: "parasol".into(), example: None }).unwrap();
+        create_card(
+            &c,
+            l1.id,
+            &NewCard {
+                front: "El  Paraguas".into(),
+                back: "parasol".into(),
+                example: None,
+            },
+        )
+        .unwrap();
         let m = existing_fronts(&c).unwrap();
         assert!(m.contains_key("el paraguas"));
         assert_eq!(normalize_front("  el   paraguas "), "el paraguas");
@@ -1301,16 +1957,134 @@ mod tests {
     fn export_import_roundtrip_is_idempotent() {
         let c = conn();
         let (_u, l1, _) = seed(&c);
-        create_cards(&c, l1.id, &[NewCard { front: "hola".into(), back: "cześć".into(), example: None }, NewCard { front: "adiós".into(), back: "pa".into(), example: None }]).unwrap();
+        create_cards(
+            &c,
+            l1.id,
+            &[
+                NewCard {
+                    front: "hola".into(),
+                    back: "cześć".into(),
+                    example: None,
+                },
+                NewCard {
+                    front: "adiós".into(),
+                    back: "pa".into(),
+                    example: None,
+                },
+            ],
+        )
+        .unwrap();
         let b = export(&c).unwrap();
         assert_eq!(b.units.len(), 1);
         assert_eq!(b.units[0].lessons[0].cards.len(), 2);
 
         let c2 = conn();
         let rep = import(&c2, &b).unwrap();
-        assert_eq!((rep.units_created, rep.lessons_created, rep.cards_created, rep.cards_skipped), (1, 2, 2, 0));
+        assert_eq!(
+            (
+                rep.units_created,
+                rep.lessons_created,
+                rep.cards_created,
+                rep.cards_skipped
+            ),
+            (1, 2, 2, 0)
+        );
         let rep = import(&c2, &b).unwrap();
-        assert_eq!((rep.units_created, rep.lessons_created, rep.cards_created, rep.cards_skipped), (0, 0, 0, 2));
+        assert_eq!(
+            (
+                rep.units_created,
+                rep.lessons_created,
+                rep.cards_created,
+                rep.cards_skipped
+            ),
+            (0, 0, 0, 2)
+        );
         assert_eq!(list_cards(&c2, &CardFilter::default()).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn update_cards_bulk_updates_content_and_preserves_srs() {
+        let c = conn();
+        let (_u, l1, _) = seed(&c);
+        let ids = create_cards(
+            &c,
+            l1.id,
+            &[
+                NewCard {
+                    front: "uno".into(),
+                    back: "one".into(),
+                    example: Some("uno por uno".into()),
+                },
+                NewCard {
+                    front: "dos".into(),
+                    back: "two".into(),
+                    example: None,
+                },
+            ],
+        )
+        .unwrap();
+
+        // Advance card 0 through SRS review so it has non-default SRS fields.
+        let rev = apply_review(&c, ids[0], Grade::Good, Some("forward"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rev.card.reps, 1);
+        assert_eq!(rev.card.status, "learned");
+        let orig_card = get_card(&c, ids[0]).unwrap().unwrap();
+
+        // Run bulk update on both cards.
+        let updates = vec![
+            BulkCardUpdate {
+                id: ids[0],
+                front: "el uno".into(),
+                back: "jeden".into(),
+                example: Some("el uno es primero".into()),
+            },
+            BulkCardUpdate {
+                id: ids[1],
+                front: "el dos".into(),
+                back: "dwa".into(),
+                example: Some("los dos".into()),
+            },
+            // Non-existent card: should not update anything or error
+            BulkCardUpdate {
+                id: 99999,
+                front: "tres".into(),
+                back: "three".into(),
+                example: None,
+            },
+        ];
+        let count = update_cards_bulk(&c, &updates).unwrap();
+        assert_eq!(count, 2);
+
+        let card0 = get_card(&c, ids[0]).unwrap().unwrap();
+        assert_eq!(card0.front, "el uno");
+        assert_eq!(card0.back, "jeden");
+        assert_eq!(card0.example.as_deref(), Some("el uno es primero"));
+        // SRS fields must be preserved exactly:
+        assert_eq!(card0.reps, orig_card.reps);
+        assert_eq!(card0.interval_days, orig_card.interval_days);
+        assert_eq!(card0.ease, orig_card.ease);
+        assert_eq!(card0.state, orig_card.state);
+        assert_eq!(card0.due, orig_card.due);
+        assert_eq!(card0.lapses, orig_card.lapses);
+        assert_eq!(card0.last_review, orig_card.last_review);
+
+        let card1 = get_card(&c, ids[1]).unwrap().unwrap();
+        assert_eq!(card1.front, "el dos");
+        assert_eq!(card1.back, "dwa");
+        assert_eq!(card1.example.as_deref(), Some("los dos"));
+        assert_eq!(card1.reps, 0);
+        assert_eq!(card1.status, "new");
+
+        // Validations
+        assert_eq!(update_cards_bulk(&c, &[]).unwrap(), 0);
+        let empty_front = vec![BulkCardUpdate {
+            id: ids[0],
+            front: "".into(),
+            back: "x".into(),
+            example: None,
+        }];
+        assert!(update_cards_bulk(&c, &empty_front).is_err());
     }
 }

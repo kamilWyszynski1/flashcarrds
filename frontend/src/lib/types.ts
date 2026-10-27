@@ -158,3 +158,28 @@ export interface ApiErrorBody {
   error: string;
   message: string;
 }
+
+export interface AiCardEdit {
+  card_id: number;
+  front: string;
+  back: string;
+  example: string | null;
+  orig_front: string;
+  orig_back: string;
+  orig_example: string | null;
+  lesson_name: string;
+}
+
+export interface AiEditResponse {
+  edits: AiCardEdit[];
+  model: string;
+  prompt: string;
+  inspected: number;
+}
+
+export interface BulkCardUpdate {
+  id: number;
+  front: string;
+  back: string;
+  example?: string | null;
+}

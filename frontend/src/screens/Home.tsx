@@ -142,6 +142,14 @@ export function Home() {
             }}
           />
           <SpeedDial
+            icon="sparkle"
+            label="From prompt"
+            onClick={() => {
+              setFabOpen(false);
+              navigate('/prompt');
+            }}
+          />
+          <SpeedDial
             icon="camera"
             label="From photo"
             onClick={() => {
@@ -159,7 +167,7 @@ export function Home() {
   );
 }
 
-function SpeedDial({ icon, label, onClick }: { icon: 'edit' | 'camera' | 'list'; label: string; onClick: () => void }) {
+function SpeedDial({ icon, label, onClick }: { icon: 'edit' | 'camera' | 'list' | 'sparkle'; label: string; onClick: () => void }) {
   return (
     <button type="button" onClick={onClick} className="flex items-center gap-2.5 bg-surface-container-lowest text-on-surface px-4 min-h-[48px] rounded-2xl shadow-float font-medium text-body-md">
       <Icon name={icon} size={22} className="text-primary" />

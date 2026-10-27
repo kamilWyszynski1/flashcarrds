@@ -365,7 +365,7 @@ function AddSourceSheet() {
     // Replace the sheet entry so back from the next screen skips the menu.
     fn();
   };
-  const Opt = ({ icon, title, text, onClick, accent }: { icon: 'camera' | 'edit' | 'list'; title: string; text: string; onClick: () => void; accent?: boolean }) => (
+  const Opt = ({ icon, title, text, onClick, accent }: { icon: 'camera' | 'edit' | 'list' | 'sparkle'; title: string; text: string; onClick: () => void; accent?: boolean }) => (
     <button type="button" onClick={onClick} className="w-full flex items-center gap-3 min-h-[60px] px-1.5 rounded-xl text-left active:bg-surface-container-low">
       <span className={`w-10 h-10 rounded-xl flex items-center justify-center ${accent ? 'bg-primary-fixed text-on-primary-fixed-variant' : 'bg-surface-container text-on-surface-variant'}`}>
         <Icon name={icon} size={22} />
@@ -380,6 +380,7 @@ function AddSourceSheet() {
   return (
     <Sheet title={target ? `Add to ${target.lesson.name}` : 'Add cards'} onClose={closeSheet}>
       <Opt icon="camera" accent title="From a photo" text="Snap the book page, review, save" onClick={() => go(() => navigate('/capture', { replace: true }))} />
+      <Opt icon="sparkle" accent title="From a prompt" text="Describe a topic, e.g. “conjugation of ser”" onClick={() => go(() => navigate('/prompt', { replace: true }))} />
       <Opt icon="edit" title="Type a card" text="One word at a time" onClick={() => go(() => { setEditingCard(null); openSheet('card', { replace: true }); })} />
       <Opt icon="list" title="Paste a list" text="“palabra – słowo” per line" onClick={() => go(() => openSheet('paste', { replace: true }))} />
     </Sheet>

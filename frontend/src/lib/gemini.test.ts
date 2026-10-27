@@ -1,14 +1,20 @@
 import { describe, expect, it } from 'vitest';
 import {
   BODY_LOG_LIMIT,
+  buildBatchEditPrompt,
+  buildGeneratePrompt,
   buildPrompt,
   buildRequestBody,
   cleanModel,
   DEFAULT_MODEL,
+  editCardsWithGemini,
+  editResponseSchema,
   extractFromGemini,
   extractWithModelFallback,
   FREE_TIER_MODELS,
+  generateFromGemini,
   MAX_IMAGE_B64_BYTES,
+  parseEditResponse,
   parseErrorBody,
   parseResponse,
   probeGeminiModel,
@@ -419,6 +425,189 @@ describe('gemini', () => {
           controller.signal
         )
       ).rejects.toThrow();
+    });
+  });
+
+  describe('generateFromGemini & buildGeneratePrompt', () => {
+    it('buildGeneratePrompt includes languages, prompt, and rules', () => {
+      const p = buildGeneratePrompt('Español', 'Polski', 'conjugation of ser verb');
+      expect(p).toContain('Español (front) -> Polski (back)');
+      expect(p).toContain('conjugation of ser verb');
+      expect(p).toContain('Do not repeat identical front values');
+      expect(p).toContain('6–25 cards');
+    });
+
+    it('generateFromGemini validates empty API key or empty prompt', async () => {
+      await expect(
+        generateFromGemini({
+          apiKey: '',
+          model: 'gemini-flash-latest',
+          prompt: 'test',
+          frontLang: 'es',
+          backLang: 'pl',
+        })
+      ).rejects.toThrow(/Gemini API key is not configured/);
+
+      await expect(
+        generateFromGemini({
+          apiKey: 'key',
+          model: 'gemini-flash-latest',
+          prompt: '   ',
+          frontLang: 'es',
+          backLang: 'pl',
+        })
+      ).rejects.toThrow(/prompt cannot be empty/);
+    });
+
+    it('generateFromGemini returns cards on 200 OK', async () => {
+      const fakeFetch: typeof fetch = async () =>
+        new Response(
+          JSON.stringify({
+            candidates: [
+              {
+                content: {
+                  parts: [
+                    {
+                      text: JSON.stringify({
+                        cards: [
+                          { front: 'yo soy', back: 'ja jestem', example: 'Yo soy estudiante.', confidence: 1.0 },
+                          { front: 'tú eres', back: 'ty jesteś', confidence: 0.95 },
+                        ],
+                      }),
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+          { status: 200 }
+        );
+
+      const cards = await generateFromGemini({
+        apiKey: 'test-key',
+        model: 'gemini-flash-latest',
+        prompt: 'ser present tense',
+        frontLang: 'Español',
+        backLang: 'Polski',
+        fetchImpl: fakeFetch,
+      });
+
+      expect(cards.length).toBe(2);
+      expect(cards[0].front).toBe('yo soy');
+      expect(cards[0].back).toBe('ja jestem');
+      expect(cards[0].example).toBe('Yo soy estudiante.');
+      expect(cards[1].front).toBe('tú eres');
+      expect(cards[1].example).toBeNull();
+    });
+  });
+
+  describe('batchEdit & buildBatchEditPrompt', () => {
+    it('buildBatchEditPrompt includes cards json and instruction', () => {
+      const p = buildBatchEditPrompt('Español', 'Polski', 'differentiate ser vs estar', [
+        { id: 1, front: 'es', back: 'jest' },
+        { id: 2, front: 'está', back: 'jest', example: 'Está en casa.' },
+      ]);
+      expect(p).toContain('differentiate ser vs estar');
+      expect(p).toContain('"id":1');
+      expect(p).toContain('"front":"es"');
+      expect(p).toContain('"id":2');
+      expect(p).toContain('"example":"Está en casa."');
+      expect(p).toContain('Return ONLY cards that actually need changes');
+    });
+
+    it('editResponseSchema has object with edits array', () => {
+      const schema: any = editResponseSchema();
+      expect(schema.type).toBe('object');
+      expect(schema.properties.edits.type).toBe('array');
+    });
+
+    it('parseEditResponse parses valid edits and cleans fields', () => {
+      const v = {
+        candidates: [
+          {
+            content: {
+              parts: [
+                {
+                  text: JSON.stringify({
+                    edits: [
+                      { id: 1, front: 'es', back: 'jest (cecha stała)', example: 'Es profesor.' },
+                      { id: 2, front: 'está', back: 'jest (stan tymczasowy)' },
+                      { id: 'not an int', front: 'bad', back: 'bad' },
+                      { id: 3, front: '', back: 'empty front' },
+                    ],
+                  }),
+                },
+              ],
+            },
+          },
+        ],
+      };
+      const edits = parseEditResponse(v);
+      expect(edits.length).toBe(2);
+      expect(edits[0]).toEqual({ id: 1, front: 'es', back: 'jest (cecha stała)', example: 'Es profesor.' });
+      expect(edits[1]).toEqual({ id: 2, front: 'está', back: 'jest (stan tymczasowy)', example: null });
+    });
+
+    it('parseEditResponse handles errors and fences', () => {
+      expect(() => parseEditResponse({ promptFeedback: { blockReason: 'OTHER' } })).toThrow('blocked by Gemini');
+      expect(() => parseEditResponse({})).toThrow('no candidates');
+      const candidateResp = {
+        candidates: [
+          {
+            content: {
+              parts: [{ text: '```json\n[{"id":5,"front":"a","back":"b"}]\n```' }],
+            },
+          },
+        ],
+      };
+      expect(() => parseEditResponse(candidateResp)).not.toThrow();
+    });
+
+    it('editCardsWithGemini validates cards and returns raw edits', async () => {
+      await expect(
+        editCardsWithGemini({
+          apiKey: 'key',
+          model: 'gemini-flash-latest',
+          prompt: 'edit',
+          cards: [],
+          frontLang: 'es',
+          backLang: 'pl',
+        })
+      ).rejects.toThrow('no cards to edit');
+
+      const fakeFetch: typeof fetch = async () =>
+        new Response(
+          JSON.stringify({
+            candidates: [
+              {
+                content: {
+                  parts: [
+                    {
+                      text: JSON.stringify({
+                        edits: [{ id: 10, front: 'ser', back: 'być (cecha)', example: 'Ser bueno.' }],
+                      }),
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+          { status: 200 }
+        );
+
+      const edits = await editCardsWithGemini({
+        apiKey: 'test-key',
+        model: 'gemini-flash-latest',
+        prompt: 'add disambiguation',
+        cards: [{ id: 10, front: 'ser', back: 'być' }],
+        frontLang: 'Español',
+        backLang: 'Polski',
+        fetchImpl: fakeFetch,
+      });
+
+      expect(edits.length).toBe(1);
+      expect(edits[0].id).toBe(10);
+      expect(edits[0].back).toBe('być (cecha)');
     });
   });
 });
