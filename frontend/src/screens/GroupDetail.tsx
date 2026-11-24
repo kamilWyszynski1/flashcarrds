@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { Icon } from '../components/Icon';
-import { Button, Chip, Empty, ErrorBox, Footer, IconButton, Progress, Spinner, TopBar } from '../components/ui';
+import { Button, Chip, Empty, ErrorBox, Footer, IconButton, Progress, Spinner, TestGradeBadge, TopBar } from '../components/ui';
 import { WordList } from '../components/WordRow';
 import { api } from '../lib/api';
 import { plural, unitShort } from '../lib/format';
@@ -108,6 +108,29 @@ export function GroupDetail() {
               <Dot cls="bg-secondary-container" label={`${detail.due} due`} />
               {detail.learning > 0 && <Dot cls="bg-secondary-container" label={`${detail.learning} learning`} />}
               <Dot cls="bg-tertiary-container" label={`${detail.learned} learned`} />
+            </div>
+            <div className="mt-3 pt-3 border-t border-outline-variant/40 flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 min-w-0 flex-wrap">
+                {detail.test_summary ? (
+                  <>
+                    <TestGradeBadge summary={detail.test_summary} />
+                    <span className="text-body-sm text-on-surface-variant">
+                      {detail.test_summary.best_correct}/{detail.test_summary.best_total} · {plural(detail.test_summary.attempts, 'attempt')}
+                    </span>
+                  </>
+                ) : (
+                  <span className="text-body-sm text-on-surface-variant">No test taken yet</span>
+                )}
+              </div>
+              <Button
+                variant="tonal"
+                size="sm"
+                icon="quiz"
+                className="shrink-0"
+                onClick={() => navigate(`/test?scope=lesson:${detail.id}`)}
+              >
+                {detail.test_summary ? 'Retake test' : 'Test'}
+              </Button>
             </div>
           </div>
         )}

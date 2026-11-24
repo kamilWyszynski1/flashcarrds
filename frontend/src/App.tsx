@@ -11,6 +11,7 @@ import { Review } from './screens/Review';
 import { Settings } from './screens/Settings';
 import { Study } from './screens/Study';
 import { Summary } from './screens/Summary';
+import { Test } from './screens/Test';
 import { SheetHost } from './sheets/Sheets';
 
 function ScrollToTop() {
@@ -40,6 +41,7 @@ export function App() {
           <Route path="/review" element={<Review />} />
           <Route path="/group/:id" element={<GroupDetail />} />
           <Route path="/study" element={<Study />} />
+          <Route path="/test" element={<Test />} />
           <Route path="/summary" element={<Summary />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="*" element={<Navigate to="/" replace />} />

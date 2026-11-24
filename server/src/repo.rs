@@ -69,7 +69,15 @@ pub fn rename_unit(conn: &Connection, id: i64, name: &str) -> Result<Option<Unit
 }
 
 pub fn delete_unit(conn: &Connection, id: i64) -> Result<bool> {
-    Ok(conn.execute("DELETE FROM units WHERE id=?1", [id])? > 0)
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM test_results WHERE (scope_type='unit' AND scope_id=?1)
+         OR (scope_type='lesson' AND scope_id IN (SELECT id FROM lessons WHERE unit_id=?1))",
+        [id],
+    )?;
+    let n = tx.execute("DELETE FROM units WHERE id=?1", [id])?;
+    tx.commit()?;
+    Ok(n > 0)
 }
 
 pub fn list_lessons(conn: &Connection) -> Result<Vec<Lesson>> {
@@ -161,7 +169,14 @@ pub fn update_lesson(
 }
 
 pub fn delete_lesson(conn: &Connection, id: i64) -> Result<bool> {
-    Ok(conn.execute("DELETE FROM lessons WHERE id=?1", [id])? > 0)
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM test_results WHERE scope_type='lesson' AND scope_id=?1",
+        [id],
+    )?;
+    let n = tx.execute("DELETE FROM lessons WHERE id=?1", [id])?;
+    tx.commit()?;
+    Ok(n > 0)
 }
 
 fn clean_name(name: &str) -> Result<String> {
@@ -184,6 +199,15 @@ pub fn overview(conn: &Connection) -> Result<Overview> {
     let settings = get_settings(conn)?;
     let units = list_units(conn)?;
 
+    let all_test_results = list_test_results(conn, &TestResultFilter { limit: Some(10_000), ..Default::default() })?;
+    let mut results_by_scope: HashMap<(String, i64), Vec<TestResult>> = HashMap::new();
+    for tr in all_test_results {
+        results_by_scope
+            .entry((tr.scope_type.clone(), tr.scope_id))
+            .or_default()
+            .push(tr);
+    }
+
     let mut st = conn.prepare(
         "SELECT l.id, l.unit_id, l.name, l.position,
                 COUNT(c.id),
@@ -196,8 +220,9 @@ pub fn overview(conn: &Connection) -> Result<Overview> {
     )?;
     let lessons: Vec<LessonOverview> = st
         .query_map([now_ts], |r| {
+            let id: i64 = r.get(0)?;
             Ok(LessonOverview {
-                id: r.get(0)?,
+                id,
                 unit_id: r.get(1)?,
                 name: r.get(2)?,
                 position: r.get(3)?,
@@ -208,19 +233,34 @@ pub fn overview(conn: &Connection) -> Result<Overview> {
                     learning: r.get(7)?,
                     learned: r.get(8)?,
                 },
+                test_summary: None,
             })
         })?
-        .collect::<Result<_, _>>()?;
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|mut l| {
+            if let Some(list) = results_by_scope.get(&("lesson".to_string(), l.id)) {
+                l.test_summary = summarize_test_results(list);
+            }
+            l
+        })
+        .collect();
 
     let mut total = Counts::default();
     let mut unit_views: Vec<UnitOverview> = units
         .into_iter()
-        .map(|u| UnitOverview {
-            id: u.id,
-            name: u.name,
-            position: u.position,
-            counts: Counts::default(),
-            lessons: vec![],
+        .map(|u| {
+            let test_summary = results_by_scope
+                .get(&("unit".to_string(), u.id))
+                .and_then(|list| summarize_test_results(list));
+            UnitOverview {
+                id: u.id,
+                name: u.name,
+                position: u.position,
+                counts: Counts::default(),
+                test_summary,
+                lessons: vec![],
+            }
         })
         .collect();
     for l in lessons {
@@ -957,6 +997,197 @@ pub fn apply_review(
 }
 
 // ---------------------------------------------------------------------------
+// Tests (quizzes & stored grades)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SaveTestResult {
+    pub scope_type: String,
+    pub scope_id: i64,
+    pub mode: String,
+    #[serde(default = "default_test_direction")]
+    pub direction: String,
+    pub correct: i64,
+    pub total: i64,
+    #[serde(default)]
+    pub duration_ms: i64,
+}
+
+fn default_test_direction() -> String {
+    "front_to_back".to_string()
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TestResultFilter {
+    pub scope_type: Option<String>,
+    pub scope_id: Option<i64>,
+    pub limit: Option<i64>,
+}
+
+pub fn score_percent(correct: i64, total: i64) -> i64 {
+    if total <= 0 {
+        return 0;
+    }
+    ((correct as f64 / total as f64) * 100.0).round() as i64
+}
+
+pub fn summarize_test_results(results: &[TestResult]) -> Option<TestSummary> {
+    if results.is_empty() {
+        return None;
+    }
+    let mut last = &results[0];
+    let mut best = &results[0];
+    for r in results.iter().skip(1) {
+        if (r.created_at, r.id) > (last.created_at, last.id) {
+            last = r;
+        }
+        if (r.score, r.total, r.created_at, r.id) > (best.score, best.total, best.created_at, best.id) {
+            best = r;
+        }
+    }
+    Some(TestSummary {
+        best_score: best.score,
+        best_correct: best.correct,
+        best_total: best.total,
+        best_mode: best.mode.clone(),
+        last_score: last.score,
+        last_correct: last.correct,
+        last_total: last.total,
+        last_mode: last.mode.clone(),
+        last_at: last.created_at,
+        attempts: results.len() as i64,
+    })
+}
+
+pub fn save_test_result(conn: &Connection, input: &SaveTestResult) -> Result<TestResult> {
+    let scope_type = input.scope_type.trim();
+    if scope_type != "unit" && scope_type != "lesson" {
+        return Err(anyhow!("scope_type must be 'unit' or 'lesson'"));
+    }
+    let mode = input.mode.trim();
+    if mode != "abcd" && mode != "written" {
+        return Err(anyhow!("mode must be 'abcd' or 'written'"));
+    }
+    let direction = input.direction.trim();
+    if direction != "front_to_back" && direction != "back_to_front" && direction != "mixed" {
+        return Err(anyhow!(
+            "direction must be 'front_to_back', 'back_to_front' or 'mixed'"
+        ));
+    }
+    if input.total <= 0 {
+        return Err(anyhow!("total must be at least 1"));
+    }
+    if input.correct < 0 || input.correct > input.total {
+        return Err(anyhow!("correct must be between 0 and total"));
+    }
+    if input.duration_ms < 0 {
+        return Err(anyhow!("duration_ms cannot be negative"));
+    }
+
+    if scope_type == "unit" {
+        if get_unit(conn, input.scope_id)?.is_none() {
+            return Err(anyhow!("unit {} does not exist", input.scope_id));
+        }
+    } else if get_lesson(conn, input.scope_id)?.is_none() {
+        return Err(anyhow!("lesson {} does not exist", input.scope_id));
+    }
+
+    let score = score_percent(input.correct, input.total);
+    let created_at = now();
+    conn.execute(
+        "INSERT INTO test_results(scope_type, scope_id, mode, direction, correct, total, score, duration_ms, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            scope_type,
+            input.scope_id,
+            mode,
+            direction,
+            input.correct,
+            input.total,
+            score,
+            input.duration_ms,
+            created_at
+        ],
+    )?;
+    Ok(TestResult {
+        id: conn.last_insert_rowid(),
+        scope_type: scope_type.to_string(),
+        scope_id: input.scope_id,
+        mode: mode.to_string(),
+        direction: direction.to_string(),
+        correct: input.correct,
+        total: input.total,
+        score,
+        duration_ms: input.duration_ms,
+        created_at,
+    })
+}
+
+pub fn list_test_results(conn: &Connection, f: &TestResultFilter) -> Result<Vec<TestResult>> {
+    let mut sql = String::from(
+        "SELECT id, scope_type, scope_id, mode, direction, correct, total, score, duration_ms, created_at
+         FROM test_results",
+    );
+    let mut wh: Vec<String> = vec![];
+    let mut args: Vec<Box<dyn ToSql>> = vec![];
+
+    if let Some(st) = f.scope_type.as_deref() {
+        if st != "unit" && st != "lesson" {
+            return Err(anyhow!("scope_type must be 'unit' or 'lesson'"));
+        }
+        args.push(Box::new(st.to_string()));
+        wh.push(format!("scope_type = ?{}", args.len()));
+    }
+    if let Some(sid) = f.scope_id {
+        args.push(Box::new(sid));
+        wh.push(format!("scope_id = ?{}", args.len()));
+    }
+    if !wh.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&wh.join(" AND "));
+    }
+    let limit = f.limit.unwrap_or(200).clamp(1, 10_000);
+    args.push(Box::new(limit));
+    sql.push_str(&format!(
+        " ORDER BY created_at DESC, id DESC LIMIT ?{}",
+        args.len()
+    ));
+
+    let mut st = conn.prepare(&sql)?;
+    let rows = st.query_map(params_from_iter(args.iter().map(|a| a.as_ref())), |r| {
+        Ok(TestResult {
+            id: r.get(0)?,
+            scope_type: r.get(1)?,
+            scope_id: r.get(2)?,
+            mode: r.get(3)?,
+            direction: r.get(4)?,
+            correct: r.get(5)?,
+            total: r.get(6)?,
+            score: r.get(7)?,
+            duration_ms: r.get(8)?,
+            created_at: r.get(9)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+pub fn test_summary_for(
+    conn: &Connection,
+    scope_type: &str,
+    scope_id: i64,
+) -> Result<Option<TestSummary>> {
+    let list = list_test_results(
+        conn,
+        &TestResultFilter {
+            scope_type: Some(scope_type.to_string()),
+            scope_id: Some(scope_id),
+            limit: Some(10_000),
+        },
+    )?;
+    Ok(summarize_test_results(&list))
+}
+
+// ---------------------------------------------------------------------------
 // Export / import
 // ---------------------------------------------------------------------------
 
@@ -968,15 +1199,33 @@ pub struct Backup {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupTestResult {
+    pub mode: String,
+    #[serde(default = "default_test_direction")]
+    pub direction: String,
+    pub correct: i64,
+    pub total: i64,
+    #[serde(default)]
+    pub score: i64,
+    #[serde(default)]
+    pub duration_ms: i64,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupUnit {
     pub name: String,
     pub lessons: Vec<BackupLesson>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test_results: Vec<BackupTestResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupLesson {
     pub name: String,
     pub cards: Vec<BackupCard>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test_results: Vec<BackupTestResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1016,6 +1265,28 @@ pub fn export(conn: &Connection) -> Result<Backup> {
             ..Default::default()
         },
     )?;
+    let test_results = list_test_results(
+        conn,
+        &TestResultFilter {
+            limit: Some(10_000),
+            ..Default::default()
+        },
+    )?;
+    let to_backup_tr = |scope_type: &str, scope_id: i64| -> Vec<BackupTestResult> {
+        test_results
+            .iter()
+            .filter(|t| t.scope_type == scope_type && t.scope_id == scope_id)
+            .map(|t| BackupTestResult {
+                mode: t.mode.clone(),
+                direction: t.direction.clone(),
+                correct: t.correct,
+                total: t.total,
+                score: t.score,
+                duration_ms: t.duration_ms,
+                created_at: t.created_at,
+            })
+            .collect()
+    };
     let out = units
         .into_iter()
         .map(|u| BackupUnit {
@@ -1039,9 +1310,11 @@ pub fn export(conn: &Connection) -> Result<Backup> {
                             last_review: c.last_review,
                         })
                         .collect(),
+                    test_results: to_backup_tr("lesson", l.id),
                     name: l.name.clone(),
                 })
                 .collect(),
+            test_results: to_backup_tr("unit", u.id),
             name: u.name,
         })
         .collect();
@@ -1058,6 +1331,55 @@ pub struct ImportReport {
     pub lessons_created: usize,
     pub cards_created: usize,
     pub cards_skipped: usize,
+}
+
+fn import_test_results_for(
+    tx: &rusqlite::Transaction<'_>,
+    scope_type: &str,
+    scope_id: i64,
+    results: &[BackupTestResult],
+) -> Result<()> {
+    for tr in results {
+        let mode = tr.mode.trim();
+        let direction = tr.direction.trim();
+        if (mode != "abcd" && mode != "written")
+            || (direction != "front_to_back" && direction != "back_to_front" && direction != "mixed")
+            || tr.total <= 0
+            || tr.correct < 0
+            || tr.correct > tr.total
+        {
+            continue;
+        }
+        let exists: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM test_results
+                 WHERE scope_type=?1 AND scope_id=?2 AND mode=?3 AND direction=?4
+                   AND correct=?5 AND total=?6 AND created_at=?7",
+                params![scope_type, scope_id, mode, direction, tr.correct, tr.total, tr.created_at],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if exists.is_some() {
+            continue;
+        }
+        let score = score_percent(tr.correct, tr.total);
+        tx.execute(
+            "INSERT INTO test_results(scope_type, scope_id, mode, direction, correct, total, score, duration_ms, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                scope_type,
+                scope_id,
+                mode,
+                direction,
+                tr.correct,
+                tr.total,
+                score,
+                tr.duration_ms.max(0),
+                tr.created_at
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 /// Merge a backup into the database: units/lessons are matched by name,
@@ -1079,6 +1401,7 @@ pub fn import(conn: &Connection, b: &Backup) -> Result<ImportReport> {
                 create_unit(&tx, &bu.name)?.id
             }
         };
+        import_test_results_for(&tx, "unit", unit_id, &bu.test_results)?;
         for bl in &bu.lessons {
             let lesson_id = match tx
                 .query_row(
@@ -1094,6 +1417,7 @@ pub fn import(conn: &Connection, b: &Backup) -> Result<ImportReport> {
                     create_lesson(&tx, unit_id, &bl.name)?.id
                 }
             };
+            import_test_results_for(&tx, "lesson", lesson_id, &bl.test_results)?;
             for bc in &bl.cards {
                 let nc = NewCard {
                     front: bc.front.clone(),
@@ -2086,5 +2410,154 @@ mod tests {
             example: None,
         }];
         assert!(update_cards_bulk(&c, &empty_front).is_err());
+    }
+
+    #[test]
+    fn test_results_crud_summary_cascade_and_backup() {
+        let c = conn();
+        let (u, l1, _l2) = seed(&c);
+
+        // Validation errors
+        assert!(save_test_result(
+            &c,
+            &SaveTestResult {
+                scope_type: "bogus".into(),
+                scope_id: l1.id,
+                mode: "abcd".into(),
+                direction: "front_to_back".into(),
+                correct: 1,
+                total: 2,
+                duration_ms: 1000,
+            }
+        )
+        .is_err());
+        assert!(save_test_result(
+            &c,
+            &SaveTestResult {
+                scope_type: "lesson".into(),
+                scope_id: 999,
+                mode: "abcd".into(),
+                direction: "front_to_back".into(),
+                correct: 1,
+                total: 2,
+                duration_ms: 1000,
+            }
+        )
+        .is_err());
+        assert!(save_test_result(
+            &c,
+            &SaveTestResult {
+                scope_type: "lesson".into(),
+                scope_id: l1.id,
+                mode: "abcd".into(),
+                direction: "front_to_back".into(),
+                correct: 3,
+                total: 2,
+                duration_ms: 1000,
+            }
+        )
+        .is_err());
+
+        // Save lesson attempts (improving then lower) and a unit attempt
+        let r1 = save_test_result(
+            &c,
+            &SaveTestResult {
+                scope_type: "lesson".into(),
+                scope_id: l1.id,
+                mode: "abcd".into(),
+                direction: "front_to_back".into(),
+                correct: 1,
+                total: 4,
+                duration_ms: 5000,
+            },
+        )
+        .unwrap();
+        assert_eq!(r1.score, 25);
+
+        let r2 = save_test_result(
+            &c,
+            &SaveTestResult {
+                scope_type: "lesson".into(),
+                scope_id: l1.id,
+                mode: "written".into(),
+                direction: "back_to_front".into(),
+                correct: 4,
+                total: 4,
+                duration_ms: 9000,
+            },
+        )
+        .unwrap();
+        assert_eq!(r2.score, 100);
+
+        save_test_result(
+            &c,
+            &SaveTestResult {
+                scope_type: "lesson".into(),
+                scope_id: l1.id,
+                mode: "abcd".into(),
+                direction: "mixed".into(),
+                correct: 3,
+                total: 4,
+                duration_ms: 4000,
+            },
+        )
+        .unwrap();
+
+        save_test_result(
+            &c,
+            &SaveTestResult {
+                scope_type: "unit".into(),
+                scope_id: u.id,
+                mode: "written".into(),
+                direction: "front_to_back".into(),
+                correct: 3,
+                total: 4,
+                duration_ms: 7000,
+            },
+        )
+        .unwrap();
+
+        let ov = overview(&c).unwrap();
+        let u_sum = ov.units[0].test_summary.as_ref().unwrap();
+        assert_eq!(u_sum.best_score, 75);
+        assert_eq!(u_sum.attempts, 1);
+        let l_sum = ov.units[0].lessons[0].test_summary.as_ref().unwrap();
+        assert_eq!(l_sum.best_score, 100);
+        assert_eq!(l_sum.best_mode, "written");
+        assert_eq!(l_sum.last_score, 75);
+        assert_eq!(l_sum.attempts, 3);
+
+        // Export & import into fresh DB is idempotent
+        let backup = export(&c).unwrap();
+        let fresh = conn();
+        import(&fresh, &backup).unwrap();
+        import(&fresh, &backup).unwrap();
+        let fresh_ov = overview(&fresh).unwrap();
+        assert_eq!(
+            fresh_ov.units[0].test_summary.as_ref().unwrap().attempts,
+            1
+        );
+        assert_eq!(
+            fresh_ov.units[0].lessons[0]
+                .test_summary
+                .as_ref()
+                .unwrap()
+                .best_score,
+            100
+        );
+        assert_eq!(
+            fresh_ov.units[0].lessons[0]
+                .test_summary
+                .as_ref()
+                .unwrap()
+                .attempts,
+            3
+        );
+
+        // Cascade delete unit removes both unit and lesson test results
+        assert!(delete_unit(&c, u.id).unwrap());
+        assert!(list_test_results(&c, &TestResultFilter::default())
+            .unwrap()
+            .is_empty());
     }
 }

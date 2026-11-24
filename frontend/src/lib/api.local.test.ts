@@ -792,4 +792,119 @@ describe('localApi (IndexedDB)', () => {
       }
     });
   });
+
+  describe('test results storage, retake improvement, cascade, and backup', () => {
+    it('saves unit and lesson test results, updates overview & lesson summaries, and validates inputs', async () => {
+      const unit = await localApi.createUnit('Unidad 12');
+      const lesson = await localApi.createLesson(unit.id, '12.1 Examen');
+      await localApi.createCards(lesson.id, [
+        { front: 'uno', back: 'jeden' },
+        { front: 'dos', back: 'dwa' },
+        { front: 'tres', back: 'trzy' },
+        { front: 'cuatro', back: 'cztery' },
+      ]);
+
+      // Validation errors
+      await expect(
+        localApi.saveTestResult({ scope_type: 'lesson', scope_id: 9999, mode: 'abcd', correct: 1, total: 2 }),
+      ).rejects.toThrow('does not exist');
+      await expect(
+        localApi.saveTestResult({ scope_type: 'unit', scope_id: 9999, mode: 'written', correct: 1, total: 2 }),
+      ).rejects.toThrow('does not exist');
+      await expect(
+        localApi.saveTestResult({ scope_type: 'lesson', scope_id: lesson.id, mode: 'abcd', correct: 0, total: 0 }),
+      ).rejects.toThrow('total must be at least 1');
+      await expect(
+        localApi.saveTestResult({ scope_type: 'lesson', scope_id: lesson.id, mode: 'abcd', correct: 5, total: 4 }),
+      ).rejects.toThrow('correct must be between 0 and total');
+      await expect(
+        localApi.saveTestResult({ scope_type: 'lesson', scope_id: lesson.id, mode: 'abcd', correct: 2, total: 4, duration_ms: -10 }),
+      ).rejects.toThrow('duration_ms');
+
+      // Initially no test_summary
+      let ov = await localApi.overview();
+      expect(ov.units[0].test_summary).toBeNull();
+      expect(ov.units[0].lessons[0].test_summary).toBeNull();
+
+      // First lesson attempt: 2/4 (50%, ABCD)
+      const r1 = await localApi.saveTestResult({
+        scope_type: 'lesson',
+        scope_id: lesson.id,
+        mode: 'abcd',
+        direction: 'front_to_back',
+        correct: 2,
+        total: 4,
+        duration_ms: 8500,
+      });
+      expect(r1.score).toBe(50);
+
+      // Retake and improve: 4/4 (100%, written)
+      const r2 = await localApi.saveTestResult({
+        scope_type: 'lesson',
+        scope_id: lesson.id,
+        mode: 'written',
+        direction: 'back_to_front',
+        correct: 4,
+        total: 4,
+        duration_ms: 15000,
+      });
+      expect(r2.score).toBe(100);
+
+      // Third attempt lower: 3/4 (75%) — best stays 100%, last becomes 75%
+      const r3 = await localApi.saveTestResult({
+        scope_type: 'lesson',
+        scope_id: lesson.id,
+        mode: 'abcd',
+        correct: 3,
+        total: 4,
+        duration_ms: 6000,
+      });
+      expect(r3.score).toBe(75);
+
+      // Unit test attempt: 3/4 (75%)
+      await localApi.saveTestResult({
+        scope_type: 'unit',
+        scope_id: unit.id,
+        mode: 'written',
+        correct: 3,
+        total: 4,
+        duration_ms: 11000,
+      });
+
+      ov = await localApi.overview();
+      expect(ov.units[0].test_summary?.best_score).toBe(75);
+      expect(ov.units[0].test_summary?.attempts).toBe(1);
+      const lSum = ov.units[0].lessons[0].test_summary!;
+      expect(lSum.best_score).toBe(100);
+      expect(lSum.best_mode).toBe('written');
+      expect(lSum.last_score).toBe(75);
+      expect(lSum.attempts).toBe(3);
+
+      // Lesson detail also carries test_summary
+      const detail = await localApi.lesson(lesson.id);
+      expect(detail.test_summary?.best_score).toBe(100);
+      expect(detail.test_summary?.attempts).toBe(3);
+
+      // Listing test results returns newest first
+      const list = await localApi.testResults({ scope_type: 'lesson', scope_id: lesson.id });
+      expect(list.length).toBe(3);
+      expect(list[0].id).toBe(r3.id);
+
+      // Export & import backup preserves test results idempotently
+      const backup = await localApi.exportBackup();
+      await resetDatabase();
+      await localApi.importBackup(backup);
+      await localApi.importBackup(backup); // second import must not duplicate results
+
+      const restoredOv = await localApi.overview();
+      expect(restoredOv.units[0].test_summary?.best_score).toBe(75);
+      expect(restoredOv.units[0].test_summary?.attempts).toBe(1);
+      expect(restoredOv.units[0].lessons[0].test_summary?.best_score).toBe(100);
+      expect(restoredOv.units[0].lessons[0].test_summary?.attempts).toBe(3);
+
+      // Deleting the unit cleans up both unit and lesson test results
+      await localApi.deleteUnit(restoredOv.units[0].id);
+      expect((await localApi.testResults()).length).toBe(0);
+    });
+  });
 });

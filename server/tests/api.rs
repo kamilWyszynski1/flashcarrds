@@ -1369,3 +1369,103 @@ async fn ai_edit_cards_and_bulk_patch_endpoint_flow() {
     assert_eq!(card["status"], "learned");
     assert_eq!(card["reps"], 1);
 }
+
+#[tokio::test]
+async fn test_results_api_and_overview_flow() {
+    let app = app();
+    let (unit_id, lesson_id) = seed(&app).await;
+
+    // Invalid scope returns 400
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/api/tests/results",
+        Some(json!({
+            "scope_type": "lesson",
+            "scope_id": 9999,
+            "mode": "abcd",
+            "correct": 1,
+            "total": 2
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // Save lesson ABCD attempt (50%) then retake Written attempt (100%)
+    let (st, r1) = call(
+        &app,
+        "POST",
+        "/api/tests/results",
+        Some(json!({
+            "scope_type": "lesson",
+            "scope_id": lesson_id,
+            "mode": "abcd",
+            "direction": "front_to_back",
+            "correct": 2,
+            "total": 4,
+            "duration_ms": 5000
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{r1}");
+    assert_eq!(r1["score"], 50);
+
+    let (st, r2) = call(
+        &app,
+        "POST",
+        "/api/tests/results",
+        Some(json!({
+            "scope_type": "lesson",
+            "scope_id": lesson_id,
+            "mode": "written",
+            "direction": "back_to_front",
+            "correct": 4,
+            "total": 4,
+            "duration_ms": 12000
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{r2}");
+    assert_eq!(r2["score"], 100);
+
+    // Save unit test result (80%)
+    let (st, ru) = call(
+        &app,
+        "POST",
+        "/api/tests/results",
+        Some(json!({
+            "scope_type": "unit",
+            "scope_id": unit_id,
+            "mode": "abcd",
+            "correct": 4,
+            "total": 5,
+            "duration_ms": 9000
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{ru}");
+    assert_eq!(ru["score"], 80);
+
+    // Overview exposes test_summary on both unit and lesson
+    let (st, ov) = call(&app, "GET", "/api/overview", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(ov["units"][0]["test_summary"]["best_score"], 80);
+    assert_eq!(ov["units"][0]["lessons"][0]["test_summary"]["best_score"], 100);
+    assert_eq!(ov["units"][0]["lessons"][0]["test_summary"]["attempts"], 2);
+
+    // Lesson detail also exposes test_summary
+    let (st, detail) = call(&app, "GET", &format!("/api/lessons/{lesson_id}"), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(detail["test_summary"]["best_score"], 100);
+
+    // GET /api/tests/results filters by scope
+    let (st, list) = call(
+        &app,
+        "GET",
+        &format!("/api/tests/results?scope_type=lesson&scope_id={lesson_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(list.as_array().unwrap().len(), 2);
+}

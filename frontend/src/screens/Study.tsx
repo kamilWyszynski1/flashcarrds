@@ -3,7 +3,7 @@ import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { Icon } from '../components/Icon';
 import { Button, Empty, ErrorBox, IconButton, Spinner } from '../components/ui';
 import { api } from '../lib/api';
-import { vibrate } from '../lib/format';
+import { cardExampleSide, vibrate } from '../lib/format';
 import { applyGrade, createSession, current, isFinished, progress, shuffle, summarize, type SessionState } from '../lib/session';
 import { useSheets } from '../lib/sheets';
 import { useStore } from '../lib/store';
@@ -183,6 +183,9 @@ export function Study() {
   const backText = forward ? item.card.back : item.card.front;
   const frontLang = forward ? settings?.front_lang : settings?.back_lang;
   const backLang = forward ? settings?.back_lang : settings?.front_lang;
+  const exSide = cardExampleSide(settings?.front_lang, settings?.back_lang);
+  const showExampleOnFront = (forward && exSide === 'front') || (!forward && exSide === 'back');
+  const showExampleOnBack = !showExampleOnFront;
   const tag = item.card.status === 'new' ? 'new' : item.card.status === 'due' ? 'due' : item.card.status === 'learning' ? 'again' : null;
   const remaining = session.queue.length;
 
@@ -205,13 +208,14 @@ export function Study() {
           className={`relative flex-1 max-h-[520px] my-auto w-full text-left [transform-style:preserve-3d] transition-transform duration-[450ms] [transition-timing-function:cubic-bezier(.2,.7,.2,1)] ${flipped ? '[transform:rotateY(180deg)]' : ''}`}
           aria-label={flipped ? 'Card back' : 'Tap to reveal'}
         >
-          <Face lang={frontLang} word={frontText} example={forward ? item.card.example : null} tag={tag} hint>
+          <Face lang={frontLang} word={frontText} example={showExampleOnFront ? item.card.example : null} tag={tag} hint>
             <Icon name="touch" size={16} /> Tap to reveal
           </Face>
           <Face
             lang={backLang}
             word={backText}
-            example={frontText}
+            subtitle={frontText}
+            example={showExampleOnBack ? item.card.example : null}
             back
             hint
             onEdit={() => {
@@ -259,6 +263,7 @@ function Shell({ children, onClose, scopeLabel }: { children: React.ReactNode; o
 function Face({
   lang,
   word,
+  subtitle,
   example,
   tag,
   back,
@@ -268,6 +273,7 @@ function Face({
 }: {
   lang?: string;
   word: string;
+  subtitle?: string | null;
   example?: string | null;
   tag?: string | null;
   back?: boolean;
@@ -278,25 +284,37 @@ function Face({
   const long = word.length > 24;
   return (
     <div
-      className={`absolute inset-0 [backface-visibility:hidden] rounded-3xl shadow-float flex flex-col items-center justify-center px-6 py-8 text-center ${
+      className={`absolute inset-0 [backface-visibility:hidden] rounded-3xl shadow-float flex flex-col items-center justify-center px-6 py-12 text-center ${
         back ? 'bg-primary-fixed [transform:rotateY(180deg)]' : 'bg-surface-container-lowest'
       }`}
     >
-      <div className="absolute top-4 inset-x-0 text-label-sm tracking-[0.08em] uppercase text-on-surface-variant font-semibold">{lang}</div>
+      <div className={`absolute top-4 inset-x-0 text-label-sm tracking-[0.08em] uppercase font-semibold ${back ? 'text-on-primary-fixed-variant' : 'text-on-surface-variant'}`}>{lang}</div>
       {tag && (
         <span className={`absolute top-3.5 right-3.5 px-2.5 py-1 rounded-full text-label-sm font-bold ${tag === 'new' ? 'bg-primary-fixed text-on-primary-fixed-variant' : tag === 'due' ? 'bg-secondary-fixed text-on-secondary-fixed' : 'bg-again-container text-again'}`}>
           {tag}
         </span>
       )}
-      <div className={`font-display text-on-surface font-bold leading-[1.15] tracking-[-0.02em] break-words max-w-full ${long ? 'text-[26px]' : 'text-[36px]'}`}>{word}</div>
-      {example && <div className="mt-3.5 text-body-md text-on-surface-variant break-words max-w-full">{example}</div>}
+      <div className={`font-display font-bold leading-[1.15] tracking-[-0.02em] break-words max-w-full ${back ? 'text-on-primary-fixed' : 'text-on-surface'} ${long ? 'text-[26px]' : 'text-[36px]'}`}>{word}</div>
+      {example?.trim() && (
+        <div
+          data-testid="card-example"
+          className={`mt-4 px-3.5 py-2 rounded-xl text-body-md italic break-words max-w-full ${
+            back ? 'bg-white/60 text-on-primary-fixed' : 'bg-surface-container-low text-on-surface-variant'
+          }`}
+        >
+          {example.trim()}
+        </div>
+      )}
+      {subtitle && (
+        <div className={`mt-3 text-body-sm break-words max-w-full ${back ? 'text-on-primary-fixed-variant/85' : 'text-on-surface-variant'}`}>{subtitle}</div>
+      )}
       {hint && (
-        <div className="absolute bottom-4 inset-x-0 flex items-center justify-center text-body-sm text-on-surface-variant">
+        <div className={`absolute bottom-4 inset-x-0 flex items-center justify-center text-body-sm ${back ? 'text-on-primary-fixed-variant' : 'text-on-surface-variant'}`}>
           {onEdit ? (
             <span
               role="button"
               tabIndex={0}
-              className="text-primary font-semibold min-h-[40px] px-3 inline-flex items-center gap-1.5"
+              className="text-on-primary-fixed-variant font-semibold min-h-[40px] px-3 inline-flex items-center gap-1.5"
               onClick={(e) => {
                 e.stopPropagation();
                 onEdit();

@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Icon } from '../components/Icon';
-import { Badge, BottomNav, Button, Card, Empty, ErrorBox, Fab, IconButton, Progress, Spinner, TopBar } from '../components/ui';
+import { Badge, BottomNav, Button, Empty, ErrorBox, Fab, IconButton, Progress, Spinner, TestGradeBadge, TopBar } from '../components/ui';
 import { estimateMinutes, lessonMeta } from '../lib/format';
 import { useSheets } from '../lib/sheets';
 import { useStore } from '../lib/store';
@@ -102,6 +102,8 @@ export function Home() {
                   key={u.id}
                   unit={u}
                   onLesson={(l) => navigate(`/group/${l.id}`)}
+                  onTestUnit={() => navigate(`/test?scope=unit:${u.id}`)}
+                  onTestLesson={(l) => navigate(`/test?scope=lesson:${l.id}`)}
                   onMenu={() => {
                     setMenuTarget({ unitId: u.id });
                     openSheet('unitmenu');
@@ -176,23 +178,51 @@ function SpeedDial({ icon, label, onClick }: { icon: 'edit' | 'camera' | 'list' 
   );
 }
 
-function UnitBlock({ unit, onLesson, onMenu, onAddLesson }: { unit: UnitOverview; onLesson: (l: LessonOverview) => void; onMenu: () => void; onAddLesson: () => void }) {
+function UnitBlock({
+  unit,
+  onLesson,
+  onTestUnit,
+  onTestLesson,
+  onMenu,
+  onAddLesson,
+}: {
+  unit: UnitOverview;
+  onLesson: (l: LessonOverview) => void;
+  onTestUnit: () => void;
+  onTestLesson: (l: LessonOverview) => void;
+  onMenu: () => void;
+  onAddLesson: () => void;
+}) {
   const done = unit.total > 0 && unit.due === 0 && unit.new === 0 && unit.learned === unit.total;
   return (
     <div className="flex flex-col space-y-2">
-      <div className="flex items-center justify-between px-1 min-h-[40px]">
+      <div className="flex items-center justify-between gap-2 px-1 min-h-[40px]">
         <button type="button" onClick={onMenu} className="min-w-0 flex-1 text-left py-2">
           <span className="text-label-sm font-semibold tracking-wider text-on-surface-variant uppercase truncate block">{unit.name}</span>
         </button>
-        {done ? (
-          <span className="flex items-center gap-1 px-2 py-0.5 rounded-full bg-tertiary-container/15 text-tertiary text-label-sm font-medium shrink-0">
-            <Icon name="check" size={14} strokeWidth={3} /> Done
-          </span>
-        ) : unit.due > 0 ? (
-          <span className="text-label-sm text-on-surface-variant shrink-0">{unit.due} due</span>
-        ) : unit.new > 0 ? (
-          <span className="text-label-sm text-on-surface-variant shrink-0">{unit.new} new</span>
-        ) : null}
+        <div className="flex items-center gap-1.5 shrink-0">
+          {unit.test_summary && <TestGradeBadge summary={unit.test_summary} compact />}
+          {done ? (
+            <span className="flex items-center gap-1 px-2 py-0.5 rounded-full bg-tertiary-container/15 text-tertiary text-label-sm font-medium shrink-0">
+              <Icon name="check" size={14} strokeWidth={3} /> Done
+            </span>
+          ) : unit.due > 0 ? (
+            <span className="text-label-sm text-on-surface-variant shrink-0">{unit.due} due</span>
+          ) : unit.new > 0 ? (
+            <span className="text-label-sm text-on-surface-variant shrink-0">{unit.new} new</span>
+          ) : null}
+          {unit.total > 0 && (
+            <button
+              type="button"
+              onClick={onTestUnit}
+              aria-label={`Test ${unit.name}`}
+              className="inline-flex items-center gap-1 h-8 px-2.5 rounded-full bg-primary-fixed text-on-primary-fixed-variant text-label-md font-semibold active:scale-95 transition-transform"
+            >
+              <Icon name="quiz" size={14} />
+              Test
+            </button>
+          )}
+        </div>
       </div>
       {unit.lessons.length === 0 && (
         <button type="button" onClick={onAddLesson} className="text-left rounded-xl bg-surface-container-low px-4 py-3 text-body-sm text-on-surface-variant">
@@ -203,19 +233,46 @@ function UnitBlock({ unit, onLesson, onMenu, onAddLesson }: { unit: UnitOverview
         const progress = l.total === 0 ? 0 : l.learned / l.total;
         const notStarted = l.total > 0 && l.new === l.total;
         return (
-          <Card key={l.id} className={`p-4 hover:shadow-md transition-shadow ${l.total === 0 ? 'opacity-80' : ''}`} onClick={() => onLesson(l)}>
-            <div className="flex items-center justify-between gap-2">
-              <div className="flex flex-col min-w-0 flex-1">
-                <span className="font-display text-headline-sm text-on-surface font-semibold truncate">{l.name}</span>
-                <span className="text-body-sm text-on-surface-variant mt-0.5">{l.total === 0 ? 'Empty · add from a photo' : lessonMeta(l)}</span>
+          <div key={l.id} className={`rounded-xl bg-surface-container-lowest shadow-card hover:shadow-md transition-shadow ${l.total === 0 ? 'opacity-80' : ''}`}>
+            <button type="button" onClick={() => onLesson(l)} className="block w-full text-left p-4">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex flex-col min-w-0 flex-1">
+                  <span className="font-display text-headline-sm text-on-surface font-semibold truncate">{l.name}</span>
+                  <span className="text-body-sm text-on-surface-variant mt-0.5">{l.total === 0 ? 'Empty · add from a photo' : lessonMeta(l)}</span>
+                </div>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  {l.due > 0 ? <Badge tone="due">{l.due} due</Badge> : notStarted ? <Badge>New</Badge> : l.new > 0 ? <Badge tone="new">{l.new} new</Badge> : null}
+                  <Icon name="chevronRight" size={20} className="text-outline-variant" />
+                </div>
               </div>
-              <div className="flex items-center gap-1.5 shrink-0">
-                {l.due > 0 ? <Badge tone="due">{l.due} due</Badge> : notStarted ? <Badge>New</Badge> : l.new > 0 ? <Badge tone="new">{l.new} new</Badge> : null}
-                <Icon name="chevronRight" size={20} className="text-outline-variant" />
+              {l.total > 0 && <Progress value={progress} className="mt-4" color={progress >= 1 ? 'bg-tertiary-container' : 'bg-primary-container'} />}
+            </button>
+            {l.total > 0 && (
+              <div className="flex items-center justify-between gap-2 px-4 pb-3 pt-2 border-t border-outline-variant/30">
+                <div className="flex items-center gap-2 min-w-0">
+                  {l.test_summary ? (
+                    <>
+                      <TestGradeBadge summary={l.test_summary} compact />
+                      <span className="text-label-md text-on-surface-variant truncate">
+                        {l.test_summary.best_correct}/{l.test_summary.best_total}
+                      </span>
+                    </>
+                  ) : (
+                    <span className="text-label-md text-on-surface-variant">Not tested yet</span>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => onTestLesson(l)}
+                  aria-label={`Test ${l.name}`}
+                  className="inline-flex items-center gap-1.5 h-8 px-3 rounded-full bg-surface-container text-primary text-label-md font-semibold active:scale-95 transition-transform shrink-0"
+                >
+                  <Icon name="quiz" size={14} />
+                  {l.test_summary ? 'Retake' : 'Test'}
+                </button>
               </div>
-            </div>
-            {l.total > 0 && <Progress value={progress} className="mt-4" color={progress >= 1 ? 'bg-tertiary-container' : 'bg-primary-container'} />}
-          </Card>
+            )}
+          </div>
         );
       })}
     </div>

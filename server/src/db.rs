@@ -93,6 +93,22 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     "
     DELETE FROM settings WHERE key IN ('gemini_api_key', 'gemini_model');
     ",
+    // v3 – stored unit/lesson test results (ABCD & written)
+    "
+    CREATE TABLE test_results (
+        id          INTEGER PRIMARY KEY,
+        scope_type  TEXT NOT NULL CHECK (scope_type IN ('unit', 'lesson')),
+        scope_id    INTEGER NOT NULL,
+        mode        TEXT NOT NULL CHECK (mode IN ('abcd', 'written')),
+        direction   TEXT NOT NULL DEFAULT 'front_to_back',
+        correct     INTEGER NOT NULL,
+        total       INTEGER NOT NULL,
+        score       INTEGER NOT NULL,
+        duration_ms INTEGER NOT NULL DEFAULT 0,
+        created_at  INTEGER NOT NULL
+    );
+    CREATE INDEX test_results_scope ON test_results(scope_type, scope_id, created_at);
+    ",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<()> {
@@ -157,7 +173,7 @@ mod tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        for t in ["units", "lessons", "cards", "reviews", "settings"] {
+        for t in ["units", "lessons", "cards", "reviews", "settings", "test_results"] {
             assert!(tables.iter().any(|x| x == t), "missing table {t}");
         }
     }

@@ -42,6 +42,19 @@ export interface DbUsage {
   count: number;
 }
 
+export interface DbTestResult {
+  id?: number;
+  scope_type: 'unit' | 'lesson';
+  scope_id: number;
+  mode: 'abcd' | 'written';
+  direction: 'front_to_back' | 'back_to_front' | 'mixed';
+  correct: number;
+  total: number;
+  score: number;
+  duration_ms: number;
+  created_at: number;
+}
+
 export const DEFAULT_SETTINGS: Record<string, string> = {
   daily_new_limit: '20',
   new_per_day: '20',
@@ -65,6 +78,7 @@ export class FiszkiDatabase extends Dexie {
   cards!: EntityTable<DbCard, 'id'>;
   settings!: EntityTable<DbSetting, 'key'>;
   usage!: EntityTable<DbUsage, 'day'>;
+  test_results!: EntityTable<DbTestResult, 'id'>;
 
   constructor(dbName = 'fiszki') {
     super(dbName);
@@ -74,6 +88,14 @@ export class FiszkiDatabase extends Dexie {
       cards: '++id, lesson_id, due, state, front, back, updated_at',
       settings: 'key',
       usage: 'day',
+    });
+    this.version(2).stores({
+      units: '++id, position, name',
+      lessons: '++id, unit_id, position, name',
+      cards: '++id, lesson_id, due, state, front, back, updated_at',
+      settings: 'key',
+      usage: 'day',
+      test_results: '++id, [scope_type+scope_id], scope_type, scope_id, created_at',
     });
   }
 }
@@ -92,14 +114,19 @@ export async function requestPersistentStorage(): Promise<boolean> {
 }
 
 export async function resetDatabase(targetDb: FiszkiDatabase = db): Promise<void> {
-  await targetDb.transaction('rw', [targetDb.units, targetDb.lessons, targetDb.cards, targetDb.settings, targetDb.usage], async () => {
-    await targetDb.units.clear();
-    await targetDb.lessons.clear();
-    await targetDb.cards.clear();
-    await targetDb.settings.clear();
-    await targetDb.usage.clear();
-    for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
-      await targetDb.settings.put({ key, value });
-    }
-  });
+  await targetDb.transaction(
+    'rw',
+    [targetDb.units, targetDb.lessons, targetDb.cards, targetDb.settings, targetDb.usage, targetDb.test_results],
+    async () => {
+      await targetDb.units.clear();
+      await targetDb.lessons.clear();
+      await targetDb.cards.clear();
+      await targetDb.settings.clear();
+      await targetDb.usage.clear();
+      await targetDb.test_results.clear();
+      for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
+        await targetDb.settings.put({ key, value });
+      }
+    },
+  );
 }

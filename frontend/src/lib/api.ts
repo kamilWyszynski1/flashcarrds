@@ -13,9 +13,12 @@ import type {
   NewCard,
   Overview,
   ReviewResult,
+  SaveTestResultInput,
   Settings,
   SettingsPatch,
   StudyItem,
+  TestResult,
+  TestScopeType,
   Unit,
 } from './types';
 
@@ -45,6 +48,9 @@ export interface FiszkiApi {
 
   studyQueue: (p?: { scope?: string; mode?: string; ids?: string; limit?: number; direction?: string }) => Promise<StudyItem[]>;
   review: (card_id: number, grade: Grade, direction: string) => Promise<ReviewResult>;
+
+  saveTestResult: (input: SaveTestResultInput) => Promise<TestResult>;
+  testResults: (filter?: { scope_type?: TestScopeType; scope_id?: number; limit?: number }) => Promise<TestResult[]>;
 
   extract: (
     images: { mime_type: string; data: string }[],

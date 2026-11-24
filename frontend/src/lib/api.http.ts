@@ -11,9 +11,12 @@ import type {
   NewCard,
   Overview,
   ReviewResult,
+  SaveTestResultInput,
   Settings,
   SettingsPatch,
   StudyItem,
+  TestResult,
+  TestScopeType,
   Unit,
 } from './types';
 import type { FiszkiApi } from './api';
@@ -80,6 +83,10 @@ export const httpApi: FiszkiApi = {
   studyQueue: (p: { scope?: string; mode?: string; ids?: string; limit?: number; direction?: string } = {}) =>
     request<StudyItem[]>('GET', `/study/queue${q(p)}`),
   review: (card_id: number, grade: Grade, direction: string) => request<ReviewResult>('POST', '/study/review', { card_id, grade, direction }),
+
+  saveTestResult: (input: SaveTestResultInput) => request<TestResult>('POST', '/tests/results', input),
+  testResults: (filter: { scope_type?: TestScopeType; scope_id?: number; limit?: number } = {}) =>
+    request<TestResult[]>('GET', `/tests/results${q(filter)}`),
 
   extract: (images: { mime_type: string; data: string }[], hint: string, signal?: AbortSignal, _opts?: ExtractOptions) =>
     request<ExtractResponse>('POST', '/extract', { images, hint }, signal),

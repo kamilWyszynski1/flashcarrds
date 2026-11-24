@@ -19,7 +19,7 @@ use crate::app::AppState;
 use crate::error::{AppError, AppResult, Json as Body};
 use crate::gemini::{self, ExtractRequest, GeminiError, ImageInput};
 use crate::models::*;
-use crate::repo::{self, Backup, CardFilter, CardPatch, NewCard, QueueRequest};
+use crate::repo::{self, Backup, CardFilter, CardPatch, NewCard, QueueRequest, SaveTestResult, TestResultFilter};
 use crate::srs::Grade;
 
 pub fn api_router() -> Router<AppState> {
@@ -43,6 +43,7 @@ pub fn api_router() -> Router<AppState> {
         )
         .route("/study/queue", get(study_queue))
         .route("/study/review", post(study_review))
+        .route("/tests/results", get(list_test_results).post(create_test_result))
         .route("/extract", post(extract))
         .route("/generate", post(generate))
         .route(
@@ -144,6 +145,7 @@ struct LessonDetail {
     unit: Unit,
     #[serde(flatten)]
     counts: Counts,
+    test_summary: Option<TestSummary>,
     cards: Vec<Card>,
 }
 
@@ -192,10 +194,12 @@ async fn get_lesson(
             _ => counts.learned += 1,
         }
     }
+    let test_summary = repo::test_summary_for(&conn, "lesson", id)?;
     Ok(Json(LessonDetail {
         lesson,
         unit,
         counts,
+        test_summary,
         cards,
     }))
 }
@@ -366,6 +370,27 @@ async fn study_review(
         .map_err(bad)?
         .map(Json)
         .ok_or_else(|| AppError::NotFound(format!("card {} not found", b.card_id)))
+}
+
+// ----- tests (quizzes) -----------------------------------------------------
+
+async fn list_test_results(
+    State(s): State<AppState>,
+    Query(f): Query<TestResultFilter>,
+) -> AppResult<Json<Vec<TestResult>>> {
+    let conn = lock(&s)?;
+    Ok(Json(repo::list_test_results(&conn, &f).map_err(bad)?))
+}
+
+async fn create_test_result(
+    State(s): State<AppState>,
+    Body(b): Body<SaveTestResult>,
+) -> AppResult<(StatusCode, Json<TestResult>)> {
+    let conn = lock(&s)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(repo::save_test_result(&conn, &b).map_err(bad)?),
+    ))
 }
 
 // ----- extraction (Gemini) --------------------------------------------------

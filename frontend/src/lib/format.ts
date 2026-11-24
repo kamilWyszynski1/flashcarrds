@@ -77,3 +77,33 @@ export function vibrate(ms: number, enabled = true) {
     }
   }
 }
+
+const SPANISH_LANG_NAMES = new Set([
+  'es',
+  'es-es',
+  'es-mx',
+  'es-419',
+  'español',
+  'espanol',
+  'spanish',
+  'castellano',
+  'hiszpański',
+  'hiszpanski',
+]);
+
+export function isSpanishLang(lang?: string | null): boolean {
+  if (!lang) return false;
+  return SPANISH_LANG_NAMES.has(lang.trim().toLowerCase());
+}
+
+/**
+ * Which side of a flashcard (`card.front` vs `card.back`) owns `card.example`.
+ * Normally `card.front` is Spanish (`es` / `Español`) and `card.example` is
+ * written in that language. If the user placed Spanish in `back_lang` instead
+ * of `front_lang`, attach `card.example` to the `back` side so it always
+ * displays on the Spanish flashcard side.
+ */
+export function cardExampleSide(frontLang?: string | null, backLang?: string | null): 'front' | 'back' {
+  if (isSpanishLang(backLang) && !isSpanishLang(frontLang)) return 'back';
+  return 'front';
+}

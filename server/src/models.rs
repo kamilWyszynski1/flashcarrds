@@ -53,6 +53,38 @@ pub struct Counts {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TestResult {
+    pub id: i64,
+    /// "unit" | "lesson"
+    pub scope_type: String,
+    pub scope_id: i64,
+    /// "abcd" | "written"
+    pub mode: String,
+    /// "front_to_back" | "back_to_front" | "mixed"
+    pub direction: String,
+    pub correct: i64,
+    pub total: i64,
+    /// 0..=100 percentage score
+    pub score: i64,
+    pub duration_ms: i64,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TestSummary {
+    pub best_score: i64,
+    pub best_correct: i64,
+    pub best_total: i64,
+    pub best_mode: String,
+    pub last_score: i64,
+    pub last_correct: i64,
+    pub last_total: i64,
+    pub last_mode: String,
+    pub last_at: i64,
+    pub attempts: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LessonOverview {
     pub id: i64,
     pub unit_id: i64,
@@ -60,6 +92,8 @@ pub struct LessonOverview {
     pub position: i64,
     #[serde(flatten)]
     pub counts: Counts,
+    #[serde(default)]
+    pub test_summary: Option<TestSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -69,6 +103,8 @@ pub struct UnitOverview {
     pub position: i64,
     #[serde(flatten)]
     pub counts: Counts,
+    #[serde(default)]
+    pub test_summary: Option<TestSummary>,
     pub lessons: Vec<LessonOverview>,
 }
 

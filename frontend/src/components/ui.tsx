@@ -1,5 +1,7 @@
 import type { ButtonHTMLAttributes, ReactNode } from 'react';
 import { NavLink, useNavigate } from 'react-router-dom';
+import { gradeForScore } from '../lib/testQuiz';
+import type { TestSummary } from '../lib/types';
 import { Icon, type IconName } from './Icon';
 
 // ---------------------------------------------------------------------------
@@ -215,14 +217,24 @@ export function Progress({ value, className = '', color = 'bg-primary-container'
   );
 }
 
-export function Badge({ children, tone = 'neutral' }: { children: ReactNode; tone?: 'neutral' | 'due' | 'new' | 'ok' }) {
+export function Badge({ children, tone = 'neutral' }: { children: ReactNode; tone?: 'neutral' | 'due' | 'new' | 'ok' | 'fail' }) {
   const t = {
     neutral: 'bg-surface-container-high text-on-surface-variant',
     due: 'bg-secondary-fixed text-on-secondary-fixed',
     new: 'bg-primary-fixed text-on-primary-fixed-variant',
     ok: 'bg-tertiary-fixed text-on-tertiary-fixed',
+    fail: 'bg-again-container text-again',
   }[tone];
   return <span className={`px-2.5 py-1 rounded-full text-label-sm font-bold whitespace-nowrap ${t}`}>{children}</span>;
+}
+
+export function TestGradeBadge({ summary, compact }: { summary: TestSummary; compact?: boolean }) {
+  const g = gradeForScore(summary.best_score);
+  return (
+    <Badge tone={g.tone}>
+      {compact ? `${g.letter} · ${summary.best_score}%` : `Grade ${g.letter} · ${summary.best_score}%`}
+    </Badge>
+  );
 }
 
 export function Spinner({ className = '' }: { className?: string }) {

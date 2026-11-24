@@ -3,7 +3,7 @@ import { ApiError } from './api';
 import { describeExtractError } from './extractError';
 import { applyGrade, createSession, current, isFinished, progress, shuffle, summarize, REQUEUE_GAP } from './session';
 import { parsePairs } from './paste';
-import { fmtInterval, lessonMeta } from './format';
+import { cardExampleSide, fmtInterval, isSpanishLang, lessonMeta } from './format';
 import { DEFAULT_THEME, THEMES, THEME_COLOR, THEME_KEY, applyTheme, isTheme, resolveTheme } from './theme';
 import type { Card, StudyItem } from './types';
 
@@ -194,6 +194,20 @@ describe('format', () => {
     expect(lessonMeta({ total: 41, new: 0, due: 7, learned: 10 })).toBe('41 cards · 7 due');
     expect(lessonMeta({ total: 32, new: 0, due: 0, learned: 32 })).toBe('32 cards · all learned');
     expect(lessonMeta({ total: 1, new: 1, due: 0, learned: 0 })).toBe('1 card · 1 new');
+  });
+  it('cardExampleSide attaches example to the Spanish side', () => {
+    expect(isSpanishLang('es')).toBe(true);
+    expect(isSpanishLang('Español')).toBe(true);
+    expect(isSpanishLang('Spanish')).toBe(true);
+    expect(isSpanishLang('Hiszpański')).toBe(true);
+    expect(isSpanishLang('pl')).toBe(false);
+    expect(cardExampleSide('es', 'pl')).toBe('front');
+    expect(cardExampleSide('Español', 'Polski')).toBe('front');
+    expect(cardExampleSide('Polski', 'Español')).toBe('back');
+    expect(cardExampleSide('Polski', 'Hiszpański')).toBe('back');
+    expect(cardExampleSide('pl', 'es')).toBe('back');
+    expect(cardExampleSide('Deutsch', 'Polski')).toBe('front');
+    expect(cardExampleSide(undefined, undefined)).toBe('front');
   });
 });
 

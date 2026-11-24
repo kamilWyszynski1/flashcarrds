@@ -489,6 +489,7 @@ function LessonMenuSheet() {
 function UnitMenuSheet() {
   const { overview, refresh, toast } = useStore();
   const { closeSheet } = useSheets();
+  const navigate = useNavigate();
   const unit = overview?.units.find((u) => u.id === menuTarget.unitId);
   const [name, setName] = useState(unit?.name ?? '');
   const [err, setErr] = useState<string | null>(null);
@@ -518,6 +519,16 @@ function UnitMenuSheet() {
 
   return (
     <Sheet title="Unit" onClose={closeSheet}>
+      {unit.total > 0 && (
+        <Button
+          variant="tonal"
+          icon="quiz"
+          className="w-full mb-2"
+          onClick={() => navigate(`/test?scope=unit:${unit.id}`, { replace: true })}
+        >
+          {unit.test_summary ? `Retake unit test (best ${unit.test_summary.best_score}%)` : 'Test this unit'}
+        </Button>
+      )}
       <Label>Name</Label>
       <input className={fieldClass} value={name} onChange={(e) => setName(e.target.value)} />
       {err && <p className="text-body-sm text-error mt-2">{err}</p>}

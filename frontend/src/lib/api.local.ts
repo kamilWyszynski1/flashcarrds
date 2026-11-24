@@ -1,6 +1,6 @@
 import { ApiError } from './api.errors';
 import type { FiszkiApi } from './api';
-import { db, DEFAULT_SETTINGS, type DbCard, type DbLesson, type DbUnit } from './db';
+import { db, DEFAULT_SETTINGS, type DbCard, type DbLesson, type DbTestResult, type DbUnit } from './db';
 import {
   RateLimiter,
   cleanModel,
@@ -30,6 +30,7 @@ import {
   type Grade,
   type SrsState,
 } from './srs';
+import { scorePercent, summarizeTestResults } from './testQuiz';
 import type {
   AiCardEdit,
   AiEditResponse,
@@ -44,9 +45,12 @@ import type {
   NewCard,
   Overview,
   ReviewResult,
+  SaveTestResultInput,
   Settings,
   SettingsPatch,
   StudyItem,
+  TestResult,
+  TestScopeType,
   Unit,
   UnitOverview,
 } from './types';
@@ -279,17 +283,44 @@ async function annotateExistingCards(cards: ExtractedCard[]): Promise<ExtractedC
   return deduplicated;
 }
 
+function toTestResult(row: DbTestResult): TestResult {
+  return {
+    id: row.id!,
+    scope_type: row.scope_type,
+    scope_id: row.scope_id,
+    mode: row.mode,
+    direction: row.direction,
+    correct: row.correct,
+    total: row.total,
+    score: row.score,
+    duration_ms: row.duration_ms,
+    created_at: row.created_at,
+  };
+}
+
 export const localApi: FiszkiApi = {
   async overview(): Promise<Overview> {
     const now = nowTs();
-    const [units, lessons, cards] = await Promise.all([
+    const [units, lessons, cards, allTestRows] = await Promise.all([
       db.units.toArray(),
       db.lessons.toArray(),
       db.cards.toArray(),
+      db.test_results.toArray(),
     ]);
 
     units.sort((a, b) => a.position - b.position || (a.id ?? 0) - (b.id ?? 0));
     lessons.sort((a, b) => a.position - b.position || (a.id ?? 0) - (b.id ?? 0));
+
+    const resultsByScope = new Map<string, TestResult[]>();
+    for (const row of allTestRows) {
+      const key = `${row.scope_type}:${row.scope_id}`;
+      let list = resultsByScope.get(key);
+      if (!list) {
+        list = [];
+        resultsByScope.set(key, list);
+      }
+      list.push(toTestResult(row));
+    }
 
     const lessonCardsMap = new Map<number, DbCard[]>();
     for (const c of cards) {
@@ -334,6 +365,7 @@ export const localApi: FiszkiApi = {
           name: l.name,
           position: l.position,
           ...lCounts,
+          test_summary: summarizeTestResults(resultsByScope.get(`lesson:${l.id!}`) ?? []),
         };
       });
 
@@ -348,6 +380,7 @@ export const localApi: FiszkiApi = {
         name: u.name,
         position: u.position,
         ...uCounts,
+        test_summary: summarizeTestResults(resultsByScope.get(`unit:${u.id!}`) ?? []),
         lessons: lessonOverviews,
       };
     });
@@ -414,12 +447,14 @@ export const localApi: FiszkiApi = {
     if (!existing) {
       throw new ApiError(404, 'not_found', `unit ${id} not found`);
     }
-    await db.transaction('rw', [db.units, db.lessons, db.cards], async () => {
+    await db.transaction('rw', [db.units, db.lessons, db.cards, db.test_results], async () => {
       const lessons = await db.lessons.where('unit_id').equals(id).toArray();
       const lessonIds = lessons.map(l => l.id!);
       for (const lid of lessonIds) {
         await db.cards.where('lesson_id').equals(lid).delete();
+        await db.test_results.where('[scope_type+scope_id]').equals(['lesson', lid]).delete();
       }
+      await db.test_results.where('[scope_type+scope_id]').equals(['unit', id]).delete();
       await db.lessons.where('unit_id').equals(id).delete();
       await db.units.delete(id);
     });
@@ -471,6 +506,9 @@ export const localApi: FiszkiApi = {
       }
     }
 
+    const testRows = await db.test_results.where('[scope_type+scope_id]').equals(['lesson', id]).toArray();
+    const test_summary = summarizeTestResults(testRows.map(toTestResult));
+
     return {
       id: lesson.id!,
       unit_id: lesson.unit_id,
@@ -478,6 +516,7 @@ export const localApi: FiszkiApi = {
       position: lesson.position,
       unit: { id: unit.id!, name: unit.name, position: unit.position },
       ...counts,
+      test_summary,
       cards: enrichedCards,
     };
   },
@@ -531,8 +570,9 @@ export const localApi: FiszkiApi = {
     if (!existing) {
       throw new ApiError(404, 'not_found', `lesson ${id} not found`);
     }
-    await db.transaction('rw', [db.lessons, db.cards], async () => {
+    await db.transaction('rw', [db.lessons, db.cards, db.test_results], async () => {
       await db.cards.where('lesson_id').equals(id).delete();
+      await db.test_results.where('[scope_type+scope_id]').equals(['lesson', id]).delete();
       await db.lessons.delete(id);
     });
   },
@@ -934,6 +974,83 @@ export const localApi: FiszkiApi = {
     };
   },
 
+  async saveTestResult(input: SaveTestResultInput): Promise<TestResult> {
+    if (input.scope_type !== 'unit' && input.scope_type !== 'lesson') {
+      throw new ApiError(400, 'validation', "scope_type must be 'unit' or 'lesson'");
+    }
+    if (input.mode !== 'abcd' && input.mode !== 'written') {
+      throw new ApiError(400, 'validation', "mode must be 'abcd' or 'written'");
+    }
+    const direction = input.direction ?? 'front_to_back';
+    if (!['front_to_back', 'back_to_front', 'mixed'].includes(direction)) {
+      throw new ApiError(400, 'validation', "direction must be 'front_to_back', 'back_to_front' or 'mixed'");
+    }
+    if (!Number.isInteger(input.total) || input.total <= 0) {
+      throw new ApiError(400, 'validation', 'total must be at least 1');
+    }
+    if (!Number.isInteger(input.correct) || input.correct < 0 || input.correct > input.total) {
+      throw new ApiError(400, 'validation', 'correct must be between 0 and total');
+    }
+    const duration_ms = Math.round(input.duration_ms ?? 0);
+    if (duration_ms < 0) {
+      throw new ApiError(400, 'validation', 'duration_ms cannot be negative');
+    }
+
+    if (input.scope_type === 'unit') {
+      if (!(await db.units.get(input.scope_id))) {
+        throw new ApiError(400, 'validation', `unit ${input.scope_id} does not exist`);
+      }
+    } else {
+      if (!(await db.lessons.get(input.scope_id))) {
+        throw new ApiError(400, 'validation', `lesson ${input.scope_id} does not exist`);
+      }
+    }
+
+    const score = scorePercent(input.correct, input.total);
+    const created_at = nowTs();
+    const id = (await db.test_results.add({
+      scope_type: input.scope_type,
+      scope_id: input.scope_id,
+      mode: input.mode,
+      direction,
+      correct: input.correct,
+      total: input.total,
+      score,
+      duration_ms,
+      created_at,
+    })) as number;
+
+    return {
+      id,
+      scope_type: input.scope_type,
+      scope_id: input.scope_id,
+      mode: input.mode,
+      direction,
+      correct: input.correct,
+      total: input.total,
+      score,
+      duration_ms,
+      created_at,
+    };
+  },
+
+  async testResults(filter: { scope_type?: TestScopeType; scope_id?: number; limit?: number } = {}): Promise<TestResult[]> {
+    let rows: DbTestResult[];
+    if (filter.scope_type && filter.scope_id !== undefined) {
+      rows = await db.test_results.where('[scope_type+scope_id]').equals([filter.scope_type, filter.scope_id]).toArray();
+    } else if (filter.scope_type) {
+      rows = await db.test_results.where('scope_type').equals(filter.scope_type).toArray();
+    } else {
+      rows = await db.test_results.toArray();
+      if (filter.scope_id !== undefined) {
+        rows = rows.filter((r) => r.scope_id === filter.scope_id);
+      }
+    }
+    rows.sort((a, b) => b.created_at - a.created_at || (b.id ?? 0) - (a.id ?? 0));
+    const limit = Math.max(1, Math.min(10000, filter.limit ?? 200));
+    return rows.slice(0, limit).map(toTestResult);
+  },
+
   async extract(
     images: { mime_type: string; data: string }[],
     hint: string,
@@ -1215,38 +1332,61 @@ export const localApi: FiszkiApi = {
   },
 
   async exportBackup(): Promise<unknown> {
-    const [units, lessons, cards] = await Promise.all([
+    const [units, lessons, cards, testRows] = await Promise.all([
       db.units.toArray(),
       db.lessons.toArray(),
       db.cards.toArray(),
+      db.test_results.toArray(),
     ]);
 
     units.sort((a, b) => a.position - b.position || (a.id ?? 0) - (b.id ?? 0));
     lessons.sort((a, b) => a.position - b.position || (a.id ?? 0) - (b.id ?? 0));
     cards.sort((a, b) => a.front.toLowerCase().localeCompare(b.front.toLowerCase()) || (a.id! - b.id!));
+    testRows.sort((a, b) => a.created_at - b.created_at || (a.id ?? 0) - (b.id ?? 0));
 
-    const exportUnits = units.map(u => ({
-      name: u.name,
-      lessons: lessons
-        .filter(l => l.unit_id === u.id)
-        .map(l => ({
-          name: l.name,
-          cards: cards
-            .filter(c => c.lesson_id === l.id)
-            .map(c => ({
-              front: c.front,
-              back: c.back,
-              example: c.example,
-              state: stateToNumber(c.state as any),
-              due: c.due,
-              interval_days: c.interval_days,
-              ease: c.ease,
-              reps: c.reps,
-              lapses: c.lapses,
-              last_review: c.last_review,
-            })),
-        })),
-    }));
+    const resultsFor = (scope_type: 'unit' | 'lesson', scope_id: number) =>
+      testRows
+        .filter((r) => r.scope_type === scope_type && r.scope_id === scope_id)
+        .map((r) => ({
+          mode: r.mode,
+          direction: r.direction,
+          correct: r.correct,
+          total: r.total,
+          score: r.score,
+          duration_ms: r.duration_ms,
+          created_at: r.created_at,
+        }));
+
+    const exportUnits = units.map((u) => {
+      const unitTests = resultsFor('unit', u.id!);
+      return {
+        name: u.name,
+        ...(unitTests.length > 0 ? { test_results: unitTests } : {}),
+        lessons: lessons
+          .filter((l) => l.unit_id === u.id)
+          .map((l) => {
+            const lessonTests = resultsFor('lesson', l.id!);
+            return {
+              name: l.name,
+              ...(lessonTests.length > 0 ? { test_results: lessonTests } : {}),
+              cards: cards
+                .filter((c) => c.lesson_id === l.id)
+                .map((c) => ({
+                  front: c.front,
+                  back: c.back,
+                  example: c.example,
+                  state: stateToNumber(c.state as any),
+                  due: c.due,
+                  interval_days: c.interval_days,
+                  ease: c.ease,
+                  reps: c.reps,
+                  lapses: c.lapses,
+                  last_review: c.last_review,
+                })),
+            };
+          }),
+      };
+    });
 
     return {
       version: 1,
@@ -1261,8 +1401,50 @@ export const localApi: FiszkiApi = {
       return rep;
     }
 
+    const importTestResultsFor = async (scope_type: 'unit' | 'lesson', scope_id: number, list: unknown) => {
+      if (!Array.isArray(list) || list.length === 0) return;
+      const existing = await db.test_results.where('[scope_type+scope_id]').equals([scope_type, scope_id]).toArray();
+      for (const raw of list) {
+        if (!raw || typeof raw !== 'object') continue;
+        const tr = raw as Record<string, unknown>;
+        const mode = tr.mode === 'abcd' || tr.mode === 'written' ? tr.mode : null;
+        const direction =
+          tr.direction === 'front_to_back' || tr.direction === 'back_to_front' || tr.direction === 'mixed'
+            ? tr.direction
+            : 'front_to_back';
+        const correct = typeof tr.correct === 'number' && Number.isInteger(tr.correct) ? tr.correct : -1;
+        const total = typeof tr.total === 'number' && Number.isInteger(tr.total) ? tr.total : 0;
+        const created_at = typeof tr.created_at === 'number' && Number.isFinite(tr.created_at) ? Math.round(tr.created_at) : 0;
+        const duration_ms =
+          typeof tr.duration_ms === 'number' && Number.isFinite(tr.duration_ms) && tr.duration_ms >= 0 ? Math.round(tr.duration_ms) : 0;
+        if (!mode || total <= 0 || correct < 0 || correct > total) continue;
+        const dup = existing.some(
+          (e) =>
+            e.mode === mode &&
+            e.direction === direction &&
+            e.correct === correct &&
+            e.total === total &&
+            e.created_at === created_at,
+        );
+        if (dup) continue;
+        const entry: DbTestResult = {
+          scope_type,
+          scope_id,
+          mode,
+          direction,
+          correct,
+          total,
+          score: scorePercent(correct, total),
+          duration_ms,
+          created_at,
+        };
+        await db.test_results.add(entry);
+        existing.push(entry);
+      }
+    };
+
     const ts = nowTs();
-    await db.transaction('rw', [db.units, db.lessons, db.cards], async () => {
+    await db.transaction('rw', [db.units, db.lessons, db.cards, db.test_results], async () => {
       for (const bu of b.units) {
         if (!bu || typeof bu.name !== 'string') continue;
         const uName = bu.name.trim();
@@ -1280,6 +1462,7 @@ export const localApi: FiszkiApi = {
         } else {
           unit_id = unit.id!;
         }
+        await importTestResultsFor('unit', unit_id, bu.test_results);
 
         if (!Array.isArray(bu.lessons)) continue;
         for (const bl of bu.lessons) {
@@ -1300,6 +1483,7 @@ export const localApi: FiszkiApi = {
           } else {
             lesson_id = lesson.id!;
           }
+          await importTestResultsFor('lesson', lesson_id, bl.test_results);
 
           if (!Array.isArray(bl.cards)) continue;
           for (const bc of bl.cards) {

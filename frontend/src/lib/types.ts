@@ -49,17 +49,59 @@ export interface Card {
   interval_label?: string;
 }
 
+export type TestScopeType = 'unit' | 'lesson';
+export type TestMode = 'abcd' | 'written';
+export type TestDirection = 'front_to_back' | 'back_to_front' | 'mixed';
+
+export interface TestResult {
+  id: number;
+  scope_type: TestScopeType;
+  scope_id: number;
+  mode: TestMode;
+  direction: TestDirection;
+  correct: number;
+  total: number;
+  score: number;
+  duration_ms: number;
+  created_at: number;
+}
+
+export interface SaveTestResultInput {
+  scope_type: TestScopeType;
+  scope_id: number;
+  mode: TestMode;
+  direction?: TestDirection;
+  correct: number;
+  total: number;
+  duration_ms?: number;
+}
+
+export interface TestSummary {
+  best_score: number;
+  best_correct: number;
+  best_total: number;
+  best_mode: TestMode;
+  last_score: number;
+  last_correct: number;
+  last_total: number;
+  last_mode: TestMode;
+  last_at: number;
+  attempts: number;
+}
+
 export interface LessonOverview extends Counts {
   id: number;
   unit_id: number;
   name: string;
   position: number;
+  test_summary?: TestSummary | null;
 }
 
 export interface UnitOverview extends Counts {
   id: number;
   name: string;
   position: number;
+  test_summary?: TestSummary | null;
   lessons: LessonOverview[];
 }
 
@@ -73,6 +115,7 @@ export interface Overview extends Counts {
 
 export interface LessonDetail extends Lesson, Counts {
   unit: Unit;
+  test_summary?: TestSummary | null;
   cards: Card[];
 }
 
