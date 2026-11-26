@@ -182,7 +182,7 @@ export function GroupDetail() {
                 Hard
               </Chip>
             </div>
-            {cards.length === 0 ? <p className="text-body-sm text-on-surface-variant text-center py-8">No cards match.</p> : <WordList cards={cards} onPick={openCard} />}
+            {cards.length === 0 ? <p className="text-body-sm text-on-surface-variant text-center py-8">No cards match.</p> : <WordList cards={cards} showExample onPick={openCard} />}
             {cards.length > 0 && cards.length < detail.total && (
               <div className="pt-3 text-center">
                 <Button
