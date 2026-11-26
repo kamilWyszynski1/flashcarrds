@@ -36,6 +36,7 @@ pub fn api_router() -> Router<AppState> {
         .route("/cards", get(list_cards).post(create_card))
         .route("/cards/bulk", post(create_cards_bulk))
         .route("/cards/bulk-patch", post(patch_cards_bulk))
+        .route("/cards/bulk-delete", post(delete_cards_bulk))
         .route("/cards/ai-edit", post(ai_edit_cards))
         .route(
             "/cards/{id}",
@@ -319,6 +320,28 @@ async fn patch_cards_bulk(
     let conn = lock(&s)?;
     let updated = repo::update_cards_bulk(&conn, &b.updates).map_err(bad)?;
     Ok(Json(json!({ "updated": updated })))
+}
+
+#[derive(Deserialize)]
+struct BulkDeleteBody {
+    ids: Vec<i64>,
+}
+
+async fn delete_cards_bulk(
+    State(s): State<AppState>,
+    Body(b): Body<BulkDeleteBody>,
+) -> AppResult<Json<Value>> {
+    if b.ids.is_empty() {
+        return Err(AppError::BadRequest("no cards to delete".into()));
+    }
+    if b.ids.len() > 500 {
+        return Err(AppError::BadRequest(
+            "too many deletes in one request (max 500)".into(),
+        ));
+    }
+    let conn = lock(&s)?;
+    let deleted = repo::delete_cards_bulk(&conn, &b.ids).map_err(bad)?;
+    Ok(Json(json!({ "deleted": deleted })))
 }
 
 async fn patch_card(
@@ -620,6 +643,8 @@ struct AiEditBody {
 #[derive(Serialize)]
 struct AiEditResponse {
     edits: Vec<AiCardEdit>,
+    additions: Vec<AiCardAddition>,
+    deletes: Vec<AiCardDelete>,
     model: String,
     prompt: String,
     inspected: usize,
@@ -705,7 +730,7 @@ async fn ai_edit_cards(
         .collect();
 
     let started = Instant::now();
-    let raw_edits = match s
+    let raw_result = match s
         .gemini
         .edit_cards(
             &api_key,
@@ -717,7 +742,7 @@ async fn ai_edit_cards(
         )
         .await
     {
-        Ok(edits) => edits,
+        Ok(res) => res,
         Err(GeminiError::NoApiKey) => {
             return Err(AppError::BadRequest(GeminiError::NoApiKey.to_string()))
         }
@@ -736,16 +761,40 @@ async fn ai_edit_cards(
 
     let orig_map: std::collections::HashMap<i64, &Card> =
         orig_cards.iter().map(|c| (c.id, c)).collect();
+
+    let mut seen_delete_ids = std::collections::HashSet::new();
+    let mut deletes = Vec::new();
+    for del_id in raw_result.deletes {
+        if !seen_delete_ids.insert(del_id) {
+            continue;
+        }
+        let Some(orig) = orig_map.get(&del_id) else {
+            continue;
+        };
+        deletes.push(AiCardDelete {
+            card_id: orig.id,
+            front: orig.front.clone(),
+            back: orig.back.clone(),
+            example: orig.example.clone(),
+            lesson_id: orig.lesson_id,
+            lesson_name: orig.lesson_name.clone(),
+        });
+    }
+
     let mut seen_edit_ids = std::collections::HashSet::new();
+    let mut edited_front_change_ids = std::collections::HashSet::new();
     let mut edits = Vec::new();
-    for raw in raw_edits {
-        if !seen_edit_ids.insert(raw.id) {
+    for raw in raw_result.edits {
+        if seen_delete_ids.contains(&raw.id) || !seen_edit_ids.insert(raw.id) {
             continue;
         }
         let Some(orig) = orig_map.get(&raw.id) else {
             continue;
         };
         if raw.front != orig.front || raw.back != orig.back || raw.example != orig.example {
+            if repo::normalize_front(&raw.front) != repo::normalize_front(&orig.front) {
+                edited_front_change_ids.insert(orig.id);
+            }
             edits.push(AiCardEdit {
                 card_id: orig.id,
                 front: raw.front,
@@ -759,9 +808,73 @@ async fn ai_edit_cards(
         }
     }
 
-    tracing::info!(edits = edits.len(), inspected = orig_cards.len(), model = %model, latency_ms = started.elapsed().as_millis() as u64, "ai-edit ok");
+    let unique_lessons: std::collections::HashSet<i64> =
+        orig_cards.iter().map(|c| c.lesson_id).collect();
+    let single_lesson = if unique_lessons.len() == 1 {
+        Some((orig_cards[0].lesson_id, orig_cards[0].lesson_name.clone()))
+    } else {
+        None
+    };
+
+    let existing_fronts = if raw_result.additions.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        let conn = lock(&s)?;
+        repo::existing_fronts(&conn)?
+    };
+
+    let mut seen_add_keys = std::collections::HashSet::new();
+    let mut additions = Vec::new();
+    for add in raw_result.additions {
+        let key = (
+            repo::normalize_front(&add.front),
+            repo::normalize_front(&add.back),
+        );
+        if !seen_add_keys.insert(key) {
+            continue;
+        }
+        let source = add.source_id.and_then(|sid| orig_map.get(&sid).copied());
+        let (lesson_id, lesson_name) = match source {
+            Some(src) => (Some(src.lesson_id), Some(src.lesson_name.clone())),
+            None => match &single_lesson {
+                Some((lid, lname)) => (Some(*lid), Some(lname.clone())),
+                None => (None, None),
+            },
+        };
+        let existing_in = existing_fronts
+            .get(&repo::normalize_front(&add.front))
+            .and_then(|(id, lesson)| {
+                if seen_delete_ids.contains(id) || edited_front_change_ids.contains(id) {
+                    None
+                } else {
+                    Some(lesson.clone())
+                }
+            });
+        additions.push(AiCardAddition {
+            front: add.front,
+            back: add.back,
+            example: add.example,
+            lesson_id,
+            lesson_name,
+            source_card_id: source.map(|c| c.id),
+            source_front: source.map(|c| c.front.clone()),
+            existing_in,
+        });
+    }
+
+    tracing::info!(
+        edits = edits.len(),
+        additions = additions.len(),
+        deletes = deletes.len(),
+        inspected = orig_cards.len(),
+        model = %model,
+        latency_ms = started.elapsed().as_millis() as u64,
+        "ai-edit ok"
+    );
     Ok(Json(AiEditResponse {
         edits,
+        additions,
+        deletes,
         model,
         prompt,
         inspected: orig_cards.len(),

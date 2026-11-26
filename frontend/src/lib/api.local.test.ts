@@ -791,6 +791,125 @@ describe('localApi (IndexedDB)', () => {
         globalThis.fetch = originalFetch;
       }
     });
+
+    it('supports additions (splits), deletes, multi-lesson anchoring, and bulk delete', async () => {
+      const unit = await localApi.createUnit('Unidad 11b');
+      const lessonA = await localApi.createLesson(unit.id, '11b.1 Rutina');
+      const lessonB = await localApi.createLesson(unit.id, '11b.2 Otros');
+
+      const levantarse = await localApi.createCard(lessonA.id, {
+        front: 'levantarse',
+        back: 'wstawać',
+        example: 'Me levanto temprano.',
+      });
+      const dupCard = await localApi.createCard(lessonB.id, {
+        front: 'duplicado',
+        back: 'duplikat',
+      });
+      const existingCard = await localApi.createCard(lessonB.id, {
+        front: 'dormir',
+        back: 'spać',
+      });
+
+      await localApi.patchSettings({ gemini_api_key: 'test-key', extract_daily_cap: 50 });
+
+      const fakeResponse = {
+        candidates: [
+          {
+            content: {
+              parts: [
+                {
+                  text: JSON.stringify({
+                    edits: [
+                      // Also in deletes below -> delete wins so card isn't both edited and deleted
+                      { id: dupCard.id, front: 'duplicado edited', back: 'duplikat' },
+                    ],
+                    additions: [
+                      // Split from levantarse -> inherits lessonA
+                      {
+                        front: 'levantar',
+                        back: 'podnosić',
+                        example: 'Voy a levantar la caja.',
+                        source_id: levantarse.id,
+                      },
+                      // Duplicate addition inside same batch -> deduplicated
+                      {
+                        front: 'levantar',
+                        back: 'podnosić',
+                        source_id: levantarse.id,
+                      },
+                      // Unanchored addition across multi-lesson scope -> lesson_id null, flagged as existing
+                      {
+                        front: 'dormir',
+                        back: 'spać',
+                      },
+                    ],
+                    deletes: [dupCard.id, dupCard.id, 999999],
+                  }),
+                },
+              ],
+            },
+          },
+        ],
+      };
+
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = async () =>
+        new Response(JSON.stringify(fakeResponse), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+
+      try {
+        const res = await localApi.aiEditCards(
+          [levantarse.id, dupCard.id, existingCard.id],
+          'Split reflexive verbs and delete duplicates',
+        );
+
+        expect(res.edits).toEqual([]);
+        expect(res.deletes).toEqual([
+          {
+            card_id: dupCard.id,
+            front: 'duplicado',
+            back: 'duplikat',
+            example: null,
+            lesson_id: lessonB.id,
+            lesson_name: '11b.2 Otros',
+          },
+        ]);
+        expect(res.additions).toEqual([
+          {
+            front: 'levantar',
+            back: 'podnosić',
+            example: 'Voy a levantar la caja.',
+            lesson_id: lessonA.id,
+            lesson_name: '11b.1 Rutina',
+            source_card_id: levantarse.id,
+            source_front: 'levantarse',
+            existing_in: null,
+          },
+          {
+            front: 'dormir',
+            back: 'spać',
+            example: null,
+            lesson_id: null,
+            lesson_name: null,
+            source_card_id: null,
+            source_front: null,
+            existing_in: '11b.2 Otros',
+          },
+        ]);
+
+        // Test deleteCardsBulk
+        await expect(localApi.deleteCardsBulk([])).rejects.toThrow('no cards to delete');
+        const delRes = await localApi.deleteCardsBulk([dupCard.id, dupCard.id, 999999]);
+        expect(delRes).toEqual({ deleted: 1 });
+        const remaining = await localApi.cards({ lesson_id: lessonB.id });
+        expect(remaining.map((c) => c.id)).toEqual([existingCard.id]);
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
   });
 
   describe('test results storage, retake improvement, cascade, and backup', () => {

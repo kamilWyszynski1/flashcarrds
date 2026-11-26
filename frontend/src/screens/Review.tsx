@@ -1,13 +1,14 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Icon } from '../components/Icon';
 import { Button, Empty, ErrorBox, Footer, GroupSelector, IconButton, Label, TopBar } from '../components/ui';
 import { api } from '../lib/api';
+import { formatEditActionLabel, formatEditSubtitle, formatEditToast, partitionEditRows, rowAction } from '../lib/batchEdit';
 import { short } from '../lib/format';
 import { captureFlowStart, historyIdx, useSheets } from '../lib/sheets';
-import { useStore, useTargetLesson, type Draft } from '../lib/store';
+import { useStore, useTargetLesson, type DraftRow } from '../lib/store';
 
-type Row = Draft['cards'][number];
+type Row = DraftRow;
 
 export function Review() {
   const navigate = useNavigate();
@@ -18,7 +19,7 @@ export function Review() {
   const [error, setError] = useState<string | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const focusNew = useRef(false);
-  const [existing, setExisting] = useState<Map<string, string> | null>(null);
+  const [existing, setExisting] = useState<Map<string, { id: number; lesson: string }[]> | null>(null);
 
   useEffect(() => {
     if (focusNew.current && listRef.current) {
@@ -28,15 +29,20 @@ export function Review() {
     }
   });
 
-  // Duplicate hints for rows the server did not annotate (pasted / typed rows).
+  // Duplicate hints for rows the server did not annotate (pasted / typed / manually added rows).
   useEffect(() => {
     let alive = true;
     api
       .cards({ limit: 10000 })
       .then((cards) => {
         if (!alive) return;
-        const m = new Map<string, string>();
-        for (const c of cards) m.set(normalize(c.front), c.lesson_name);
+        const m = new Map<string, { id: number; lesson: string }[]>();
+        for (const c of cards) {
+          const norm = normalize(c.front);
+          const list = m.get(norm) ?? [];
+          list.push({ id: c.id, lesson: c.lesson_name });
+          m.set(norm, list);
+        }
         setExisting(m);
       })
       .catch(() => {});
@@ -44,6 +50,15 @@ export function Review() {
       alive = false;
     };
   }, []);
+
+  const deletingIds = useMemo(() => {
+    if (!draft || draft.source !== 'edit') return new Set<number>();
+    return new Set(
+      draft.cards
+        .filter((r) => r.include && rowAction(r) === 'delete' && r.card_id != null)
+        .map((r) => r.card_id!),
+    );
+  }, [draft]);
 
   if (!draft) {
     return (
@@ -62,34 +77,104 @@ export function Review() {
   const remove = (key: number) => setDraft((d) => d && { ...d, cards: d.cards.filter((r) => r.key !== key) });
   const add = () => {
     focusNew.current = true;
-    setDraft((d) => d && { ...d, cards: [...d.cards, { front: '', back: '', confidence: 1, include: true, key: Math.max(0, ...d.cards.map((c) => c.key)) + 1 }] });
+    setDraft((d) => {
+      if (!d) return d;
+      const nextKey = Math.max(0, ...d.cards.map((c) => c.key)) + 1;
+      const base: Row = { front: '', back: '', confidence: 1, include: true, key: nextKey };
+      if (d.source === 'edit') {
+        base.action = 'add';
+        base.lesson_id = d.editLessonId ?? target?.lesson.id ?? null;
+        base.lesson_name = d.editLessonId ? null : (target?.lesson.name ?? null);
+      }
+      return { ...d, cards: [...d.cards, base] };
+    });
   };
   const swap = () => {
     setDraft((d) => d && { ...d, cards: d.cards.map((r) => ({ ...r, front: r.back, back: r.front })) });
     toast('Front and back swapped');
   };
 
-  const selected = rows.filter((r) => r.include && r.front.trim() && r.back.trim());
-  const incomplete = rows.filter((r) => r.include && (!r.front.trim() || !r.back.trim())).length;
+  const editPart = isEdit ? partitionEditRows(rows) : null;
+  const selected = isEdit ? [] : rows.filter((r) => r.include && r.front.trim() && r.back.trim());
+  const incomplete = isEdit
+    ? editPart!.incomplete
+    : rows.filter((r) => r.include && (!r.front.trim() || !r.back.trim())).length;
+
+  const hasUnassignedAdditions = Boolean(
+    isEdit && editPart!.additions.some((r) => !r.lesson_id && !draft.editLessonId),
+  );
+  const canSaveEdit = Boolean(
+    isEdit && editPart!.totalSelected > 0 && (!hasUnassignedAdditions || Boolean(target)),
+  );
+  const onlyDeletesSelected = Boolean(
+    isEdit && editPart!.deletes.length > 0 && editPart!.edits.length === 0 && editPart!.additions.length === 0,
+  );
+
+  const existingLessonFor = (front: string): string | undefined => {
+    const entries = existing?.get(normalize(front));
+    if (!entries) return undefined;
+    return entries.find((e) => !deletingIds.has(e.id))?.lesson;
+  };
 
   const save = async () => {
-    if (selected.length === 0) return;
-    if (!isEdit && !target) return;
+    if (isEdit) {
+      if (!canSaveEdit || !editPart) return;
+    } else {
+      if (selected.length === 0 || !target) return;
+    }
     setSaving(true);
     setError(null);
+    let mutated = false;
     try {
-      if (isEdit) {
-        const res = await api.updateCardsBulk(
-          selected.map((r) => ({
-            id: r.card_id!,
-            front: r.front.trim(),
-            back: r.back.trim(),
-            example: r.example?.trim() || null,
-          }))
-        );
+      if (isEdit && editPart) {
+        let updated = 0;
+        let created = 0;
+        let deleted = 0;
+
+        if (editPart.edits.length > 0) {
+          const res = await api.updateCardsBulk(
+            editPart.edits.map((r) => ({
+              id: r.card_id!,
+              front: r.front.trim(),
+              back: r.back.trim(),
+              example: r.example?.trim() || null,
+            })),
+          );
+          updated = res.updated;
+          mutated = true;
+        }
+
+        if (editPart.additions.length > 0) {
+          const byLesson = new Map<number, Row[]>();
+          for (const r of editPart.additions) {
+            const lessonId = r.lesson_id ?? draft.editLessonId ?? target!.lesson.id;
+            const group = byLesson.get(lessonId) ?? [];
+            group.push(r);
+            byLesson.set(lessonId, group);
+          }
+          for (const [lessonId, group] of byLesson) {
+            const res = await api.createCards(
+              lessonId,
+              group.map((r) => ({
+                front: r.front.trim(),
+                back: r.back.trim(),
+                example: r.example?.trim() || null,
+              })),
+            );
+            created += res.created;
+            mutated = true;
+          }
+        }
+
+        if (editPart.deletes.length > 0) {
+          const res = await api.deleteCardsBulk(editPart.deletes.map((r) => r.card_id!));
+          deleted = res.deleted;
+          mutated = true;
+        }
+
         setDraft(null);
         void refresh();
-        toast(`${res.updated} ${res.updated === 1 ? 'card' : 'cards'} updated`);
+        toast(formatEditToast({ updated, created, deleted }));
       } else {
         const res = await api.createCards(
           target!.lesson.id,
@@ -109,19 +194,20 @@ export function Review() {
       else if (idx >= 1) navigate(-1);
       else navigate('/', { replace: true });
     } catch (e) {
+      if (mutated) void refresh();
       setError((e as Error).message);
       setSaving(false);
     }
   };
 
   const subtitle = isEdit
-    ? `${rows.length} ${rows.length === 1 ? 'card' : 'cards'} updated · tap any text to edit`
+    ? formatEditSubtitle(rows)
     : `${rows.length} ${rows.length === 1 ? 'card' : 'cards'} found · tap any text to edit`;
 
   return (
     <div className="min-h-dvh bg-surface pb-32">
       <TopBar
-        title={isEdit ? 'Review edits' : 'Review'}
+        title={isEdit ? 'Review changes' : 'Review'}
         subtitle={subtitle}
         back
         right={!isEdit ? <IconButton icon="swap" label="Swap front/back for all" onClick={swap} /> : undefined}
@@ -170,7 +256,7 @@ export function Review() {
           </div>
         )}
 
-        {rows.length === 0 && <Empty icon="sparkle" title="No cards found" text="Try a sharper photo, a tighter crop, or a different hint." />}
+        {rows.length === 0 && <Empty icon="sparkle" title={isEdit ? 'No pending changes' : 'No cards found'} text={isEdit ? 'All suggested changes were dismissed.' : 'Try a sharper photo, a tighter crop, or a different hint.'} />}
 
         <div ref={listRef} className="space-y-2.5">
           {rows.map((r) => (
@@ -179,7 +265,7 @@ export function Review() {
               row={r}
               onChange={(p) => update(r.key, p)}
               onRemove={() => remove(r.key)}
-              existingIn={existing?.get(normalize(r.front))}
+              existingIn={existingLessonFor(r.front)}
               isEdit={isEdit}
               editLessonId={draft.editLessonId}
             />
@@ -196,7 +282,20 @@ export function Review() {
             <GroupSelector unit={target?.unit.name} lesson={target?.lesson.name} onClick={() => openPicker()} />
           </>
         ) : (
-          <p className="text-body-sm text-on-surface-variant mt-3">Uncheck any card to leave it unchanged. Study progress is kept.</p>
+          <>
+            {(draft.editLessonId || target) && (
+              <button type="button" onClick={add} className="mt-3 w-full flex items-center justify-center gap-2 min-h-[52px] border-2 border-dashed border-outline-variant rounded-xl text-primary font-semibold text-label-lg">
+                <Icon name="plus" size={20} strokeWidth={2.2} /> Add another card
+              </button>
+            )}
+            {hasUnassignedAdditions && (
+              <>
+                <Label>Save new cards to</Label>
+                <GroupSelector unit={target?.unit.name} lesson={target?.lesson.name} onClick={() => openPicker()} />
+              </>
+            )}
+            <p className="text-body-sm text-on-surface-variant mt-3">Uncheck any item to skip it. Study progress is kept on edited cards.</p>
+          </>
         )}
 
         {incomplete > 0 && <p className="text-body-sm text-on-surface-variant mt-2">{incomplete} ticked {incomplete === 1 ? 'row is' : 'rows are'} missing a side and will be skipped.</p>}
@@ -207,9 +306,20 @@ export function Review() {
         )}
       </main>
       <Footer>
-        {isEdit ? (
-          <Button className="flex-1" disabled={selected.length === 0 || saving} onClick={() => void save()}>
-            {saving ? 'Updating…' : `Update ${selected.length} ${selected.length === 1 ? 'card' : 'cards'}`}
+        {isEdit && editPart ? (
+          <Button
+            variant={onlyDeletesSelected ? 'danger' : 'primary'}
+            className="flex-1"
+            disabled={!canSaveEdit || saving}
+            onClick={() => void save()}
+          >
+            {saving
+              ? 'Applying…'
+              : formatEditActionLabel({
+                  edits: editPart.edits.length,
+                  additions: editPart.additions.length,
+                  deletes: editPart.deletes.length,
+                })}
           </Button>
         ) : (
           <Button className="flex-1" disabled={selected.length === 0 || saving || !target} onClick={() => void save()}>
@@ -236,35 +346,80 @@ function ReviewRow({
   isEdit?: boolean;
   editLessonId?: number;
 }) {
+  const action = isEdit ? rowAction(row) : 'add';
+  const isDelete = isEdit && action === 'delete';
+  const isAdd = isEdit && action === 'add';
+  const isModify = isEdit && action === 'edit';
   const low = row.confidence < 0.7;
-  const dup = !isEdit ? (row.existing_in ?? existingIn) : null;
+  const dup = (!isEdit || isAdd) ? (row.existing_in ?? existingIn) : null;
   const input = 'w-full bg-surface-container-low rounded-[10px] px-3 min-h-[44px] text-[16px] text-on-surface border-2 border-transparent focus:border-primary focus:bg-surface-container-lowest outline-none placeholder:text-outline';
+
+  const badge = isDelete
+    ? { label: 'Delete', cls: 'bg-again-container text-again' }
+    : isAdd
+      ? { label: 'New', cls: 'bg-good-container text-good' }
+      : { label: 'Edit', cls: 'bg-primary-fixed text-on-primary-fixed-variant' };
+
   return (
-    <div className={`grid grid-cols-[40px_1fr_40px] gap-x-1.5 gap-y-2 items-center rounded-xl bg-surface-container-lowest shadow-card py-2.5 pl-1.5 pr-2 ${row.include ? '' : 'opacity-50'}`}>
+    <div
+      data-testid={isEdit ? `review-row-${action}` : 'review-row'}
+      className={`grid grid-cols-[40px_1fr_40px] gap-x-1.5 gap-y-2 items-center rounded-xl bg-surface-container-lowest shadow-card py-2.5 pl-1.5 pr-2 ${
+        isDelete && row.include ? 'ring-1 ring-again/40' : ''
+      } ${row.include ? '' : 'opacity-50'}`}
+    >
+      {isEdit && (
+        <div className="col-start-2 col-span-2 flex items-center gap-2 min-w-0 flex-wrap">
+          <span className={`px-2 py-0.5 rounded-full text-label-sm font-bold shrink-0 ${badge.cls}`}>{badge.label}</span>
+          {isAdd && row.source_front && (
+            <span className="text-label-md text-on-surface-variant truncate">from {row.source_front}</span>
+          )}
+          {row.lesson_name && !editLessonId && (
+            <span className="text-label-md text-outline truncate">in {row.lesson_name}</span>
+          )}
+        </div>
+      )}
       <button
         type="button"
         role="checkbox"
         aria-checked={row.include}
-        aria-label="Include card"
+        aria-label={isDelete ? 'Confirm delete' : 'Include card'}
         onClick={() => onChange({ include: !row.include })}
         className="w-10 h-10 flex items-center justify-center rounded-full"
       >
-        <span className={`w-6 h-6 rounded-[7px] border-2 flex items-center justify-center ${row.include ? 'bg-primary-container border-primary-container text-on-primary' : 'border-outline'}`}>
+        <span
+          className={`w-6 h-6 rounded-[7px] border-2 flex items-center justify-center ${
+            row.include
+              ? isDelete
+                ? 'bg-again border-again text-on-error'
+                : 'bg-primary-container border-primary-container text-on-primary'
+              : 'border-outline'
+          }`}
+        >
           {row.include && <Icon name="check" size={16} strokeWidth={3} />}
         </span>
       </button>
-      <div className="flex flex-col gap-1.5 min-w-0">
-        <input data-front className={input} value={row.front} onChange={(e) => onChange({ front: e.target.value })} placeholder="front" autoCapitalize="none" />
-        <input className={`${input} ${low ? 'border-secondary-container' : ''}`} value={row.back} onChange={(e) => onChange({ back: e.target.value })} placeholder="back" autoCapitalize="none" />
-        {row.example !== undefined && row.example !== null ? (
-          <input className={`${input} text-body-sm min-h-[40px]`} value={row.example} onChange={(e) => onChange({ example: e.target.value })} placeholder="example sentence" />
-        ) : (
-          <button type="button" onClick={() => onChange({ example: '' })} className="self-start text-label-md text-primary font-medium px-1">
-            + example
-          </button>
-        )}
-      </div>
-      <button type="button" aria-label="Remove" onClick={onRemove} className="w-10 h-10 rounded-full flex items-center justify-center text-on-surface-variant">
+      {isDelete ? (
+        <div className="flex flex-col gap-0.5 min-w-0 py-1 px-1">
+          <div className="text-body-md font-semibold text-on-surface line-through opacity-80 break-words">{row.front}</div>
+          <div className="text-body-sm text-on-surface-variant line-through opacity-80 break-words">{row.back}</div>
+          {row.example?.trim() && (
+            <div className="text-body-sm italic text-on-surface-variant/80 line-through break-words mt-0.5">{row.example.trim()}</div>
+          )}
+        </div>
+      ) : (
+        <div className="flex flex-col gap-1.5 min-w-0">
+          <input data-front className={input} value={row.front} onChange={(e) => onChange({ front: e.target.value })} placeholder="front" autoCapitalize="none" />
+          <input className={`${input} ${low ? 'border-secondary-container' : ''}`} value={row.back} onChange={(e) => onChange({ back: e.target.value })} placeholder="back" autoCapitalize="none" />
+          {row.example !== undefined && row.example !== null ? (
+            <input className={`${input} text-body-sm min-h-[40px]`} value={row.example} onChange={(e) => onChange({ example: e.target.value })} placeholder="example sentence" />
+          ) : (
+            <button type="button" onClick={() => onChange({ example: '' })} className="self-start text-label-md text-primary font-medium px-1">
+              + example
+            </button>
+          )}
+        </div>
+      )}
+      <button type="button" aria-label={isDelete ? 'Keep card' : 'Remove'} onClick={onRemove} className="w-10 h-10 rounded-full flex items-center justify-center text-on-surface-variant">
         <Icon name="close" size={20} />
       </button>
       {low && (
@@ -278,7 +433,7 @@ function ReviewRow({
           {row.include ? '' : ' – unchecked to avoid a duplicate'}
         </div>
       )}
-      {isEdit && (
+      {isModify && (
         <div className="col-start-2 col-span-2 text-label-md text-on-surface-variant space-y-0.5">
           {row.orig_front !== undefined && (row.orig_front !== row.front || row.orig_back !== row.back) && (
             <div>
@@ -289,9 +444,6 @@ function ReviewRow({
             <div>
               Prev example: <span className="line-through opacity-80">{row.orig_example}</span>
             </div>
-          )}
-          {row.lesson_name && !editLessonId && (
-            <div className="text-outline">In {row.lesson_name}</div>
           )}
         </div>
       )}

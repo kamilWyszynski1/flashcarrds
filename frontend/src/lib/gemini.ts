@@ -131,6 +131,19 @@ export interface RawCardEdit {
   example: string | null;
 }
 
+export interface RawCardAddition {
+  front: string;
+  back: string;
+  example: string | null;
+  source_id: number | null;
+}
+
+export interface RawBatchEditResult {
+  edits: RawCardEdit[];
+  additions: RawCardAddition[];
+  deletes: number[];
+}
+
 export function buildBatchEditPrompt(
   frontLang: string,
   backLang: string,
@@ -146,18 +159,23 @@ export function buildBatchEditPrompt(
       ...(c.example ? { example: c.example } : {}),
     }))
   );
-  return `You are helping a learner batch-edit existing vocabulary flashcards.
+  return `You are helping a learner batch-edit a set of vocabulary flashcards.
 The flashcards have:
 - "front" in ${frontLang}
 - "back" in ${backLang}
 - optional "example" sentence in ${frontLang}
 
-The learner's instruction for editing these cards:
+The learner's instruction:
 ${p}
 
+You can perform any combination of three operations:
+1. "edits": modify existing cards in place. Every item MUST keep its exact "id" from the input JSON list (never invent new IDs here). Return ONLY cards that actually need changes; omit unchanged cards.
+2. "additions": create new cards (for example when splitting a card into multiple cards, adding a related form like non-reflexive "levantar" alongside "levantarse", or adding extra cards requested by the learner). When an addition is split or derived from an existing card, set "source_id" to that card's "id" so it is placed in the same lesson.
+3. "deletes": array of existing card "id" integers to remove (only when the learner asks to delete, remove, deduplicate, or replace cards). Never list the same "id" in both "edits" and "deletes".
+
 Rules:
-- Return ONLY cards that actually need changes to satisfy the instruction; omit cards that need no change.
-- Every returned item MUST keep its exact "id" from the input JSON list. Never invent new IDs.
+- Return empty arrays for any operation not needed by the instruction (never add or delete cards unless requested).
+- When splitting a card (e.g. keeping an existing card and adding a second card, or splitting one entry into two): keep the original card untouched (omit it from "edits") or update it in "edits" to preserve its study progress, and put the newly created card(s) in "additions" with "source_id" set to the original card's "id".
 - When adding context/disambiguation (e.g. differentiating ser vs estar), keep it concise (e.g. short note in parentheses on back or front as appropriate) while preserving accurate translations.
 - Keep existing example if still valid (unless asked to change/remove it), or add/update example if requested/helpful.
 - Return only JSON matching the schema.
@@ -184,8 +202,25 @@ export function editResponseSchema(): unknown {
           required: ['id', 'front', 'back'],
         },
       },
+      additions: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            front: { type: 'string' },
+            back: { type: 'string' },
+            example: { type: 'string' },
+            source_id: { type: 'integer' },
+          },
+          required: ['front', 'back'],
+        },
+      },
+      deletes: {
+        type: 'array',
+        items: { type: 'integer' },
+      },
     },
-    required: ['edits'],
+    required: ['edits', 'additions', 'deletes'],
   };
 }
 
@@ -287,7 +322,7 @@ export function parseResponse(v: any): ExtractedCard[] {
   return out;
 }
 
-export function parseEditResponse(v: any): RawCardEdit[] {
+export function parseEditResponse(v: any): RawBatchEditResult {
   if (v?.promptFeedback?.blockReason) {
     throw new Error(`request was blocked by Gemini (${v.promptFeedback.blockReason})`);
   }
@@ -307,15 +342,28 @@ export function parseEditResponse(v: any): RawCardEdit[] {
   } catch (e) {
     throw new Error(`answer was not valid JSON: ${(e as Error).message}`);
   }
-  let rawEdits: any[];
+
+  let rawEdits: any[] = [];
+  let rawAdditions: any[] = [];
+  let rawDeletes: any[] = [];
+
   if (Array.isArray(parsed)) {
     rawEdits = parsed;
-  } else if (parsed && typeof parsed === 'object' && Array.isArray(parsed.edits)) {
-    rawEdits = parsed.edits;
+  } else if (parsed && typeof parsed === 'object') {
+    const hasEdits = Array.isArray(parsed.edits);
+    const hasAdditions = Array.isArray(parsed.additions);
+    const hasDeletes = Array.isArray(parsed.deletes);
+    if (!hasEdits && !hasAdditions && !hasDeletes) {
+      throw new Error('answer has no "edits", "additions", or "deletes" array');
+    }
+    if (hasEdits) rawEdits = parsed.edits;
+    if (hasAdditions) rawAdditions = parsed.additions;
+    if (hasDeletes) rawDeletes = parsed.deletes;
   } else {
-    throw new Error('answer has no "edits" array');
+    throw new Error('answer has unexpected shape');
   }
-  const out: RawCardEdit[] = [];
+
+  const edits: RawCardEdit[] = [];
   for (const c of rawEdits) {
     if (typeof c?.id !== 'number' || !Number.isFinite(c.id)) {
       continue;
@@ -326,14 +374,42 @@ export function parseEditResponse(v: any): RawCardEdit[] {
       continue;
     }
     const example = c.example ? String(c.example).trim() || null : null;
-    out.push({
+    edits.push({
       id: Math.round(c.id),
       front,
       back,
       example,
     });
   }
-  return out;
+
+  const additions: RawCardAddition[] = [];
+  for (const c of rawAdditions) {
+    if (!c || typeof c !== 'object') continue;
+    const front = String(c.front || '').trim();
+    const back = String(c.back || '').trim();
+    if (!front || !back) {
+      continue;
+    }
+    const example = c.example ? String(c.example).trim() || null : null;
+    const source_id = typeof c.source_id === 'number' && Number.isFinite(c.source_id) ? Math.round(c.source_id) : null;
+    additions.push({
+      front,
+      back,
+      example,
+      source_id,
+    });
+  }
+
+  const deletes: number[] = [];
+  for (const d of rawDeletes) {
+    if (typeof d === 'number' && Number.isFinite(d)) {
+      deletes.push(Math.round(d));
+    } else if (d && typeof d === 'object' && typeof d.id === 'number' && Number.isFinite(d.id)) {
+      deletes.push(Math.round(d.id));
+    }
+  }
+
+  return { edits, additions, deletes };
 }
 
 export function truncateBody(s: string, limit = BODY_LOG_LIMIT): string {
@@ -613,7 +689,7 @@ export async function editCardsWithGemini(opts: {
   baseUrl?: string;
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
-}): Promise<RawCardEdit[]> {
+}): Promise<RawBatchEditResult> {
   const apiKey = opts.apiKey.trim();
   if (!apiKey) {
     throw new Error('Gemini API key is not configured – set GEMINI_API_KEY on the server');

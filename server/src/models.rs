@@ -229,6 +229,35 @@ pub struct AiCardEdit {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AiCardAddition {
+    pub front: String,
+    pub back: String,
+    #[serde(default)]
+    pub example: Option<String>,
+    #[serde(default)]
+    pub lesson_id: Option<i64>,
+    #[serde(default)]
+    pub lesson_name: Option<String>,
+    #[serde(default)]
+    pub source_card_id: Option<i64>,
+    #[serde(default)]
+    pub source_front: Option<String>,
+    #[serde(default)]
+    pub existing_in: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AiCardDelete {
+    pub card_id: i64,
+    pub front: String,
+    pub back: String,
+    #[serde(default)]
+    pub example: Option<String>,
+    pub lesson_id: i64,
+    pub lesson_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BulkCardUpdate {
     pub id: i64,
     pub front: String,

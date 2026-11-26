@@ -11,7 +11,7 @@ import {
   validateImages,
   MAX_EDIT_CARDS,
   MAX_HINT_CHARS,
-  type RawCardEdit,
+  type RawBatchEditResult,
 } from './gemini';
 import {
   fmtDays,
@@ -32,6 +32,8 @@ import {
 } from './srs';
 import { scorePercent, summarizeTestResults } from './testQuiz';
 import type {
+  AiCardAddition,
+  AiCardDelete,
   AiCardEdit,
   AiEditResponse,
   BulkCardUpdate,
@@ -804,6 +806,26 @@ export const localApi: FiszkiApi = {
     await db.cards.delete(id);
   },
 
+  async deleteCardsBulk(ids: number[]): Promise<{ deleted: number }> {
+    if (ids.length === 0) {
+      throw new ApiError(400, 'validation', 'no cards to delete');
+    }
+    if (ids.length > 500) {
+      throw new ApiError(400, 'validation', 'too many deletes (max 500)');
+    }
+    const uniqueIds = Array.from(new Set(ids));
+    let deleted = 0;
+    await db.transaction('rw', db.cards, async () => {
+      for (const id of uniqueIds) {
+        const existing = await db.cards.get(id);
+        if (!existing) continue;
+        await db.cards.delete(id);
+        deleted += 1;
+      }
+    });
+    return { deleted };
+  },
+
   async studyQueue(p: { scope?: string; mode?: string; ids?: string; limit?: number; direction?: string } = {}): Promise<StudyItem[]> {
     const now = nowTs();
     const [allDbCards, lessons, units] = await Promise.all([
@@ -1169,9 +1191,9 @@ export const localApi: FiszkiApi = {
 
     const { apiKey, model, frontLang, backLang } = await prepareGeminiCall(opts);
 
-    let rawEdits: RawCardEdit[];
+    let rawResult: RawBatchEditResult;
     try {
-      rawEdits = await editCardsWithGemini({
+      rawResult = await editCardsWithGemini({
         apiKey,
         model,
         prompt: truncatedPrompt,
@@ -1189,10 +1211,29 @@ export const localApi: FiszkiApi = {
     }
 
     const origMap = new Map(origCards.map((c) => [c.id!, c]));
+
+    const seenDeleteIds = new Set<number>();
+    const deletes: AiCardDelete[] = [];
+    for (const delId of rawResult.deletes) {
+      if (seenDeleteIds.has(delId)) continue;
+      const orig = origMap.get(delId);
+      if (!orig) continue;
+      seenDeleteIds.add(delId);
+      deletes.push({
+        card_id: orig.id!,
+        front: orig.front,
+        back: orig.back,
+        example: orig.example ?? null,
+        lesson_id: orig.lesson_id,
+        lesson_name: lessonMap.get(orig.lesson_id) ?? '',
+      });
+    }
+
     const seenEditIds = new Set<number>();
+    const editedFrontChangeIds = new Set<number>();
     const edits: AiCardEdit[] = [];
-    for (const edit of rawEdits) {
-      if (seenEditIds.has(edit.id)) continue;
+    for (const edit of rawResult.edits) {
+      if (seenEditIds.has(edit.id) || seenDeleteIds.has(edit.id)) continue;
       const orig = origMap.get(edit.id);
       if (!orig) continue;
       seenEditIds.add(edit.id);
@@ -1201,6 +1242,9 @@ export const localApi: FiszkiApi = {
         edit.back !== orig.back ||
         (edit.example ?? null) !== (orig.example ?? null);
       if (!changed) continue;
+      if (normalizeFront(edit.front) !== normalizeFront(orig.front)) {
+        editedFrontChangeIds.add(orig.id!);
+      }
       edits.push({
         card_id: orig.id!,
         front: edit.front,
@@ -1213,8 +1257,46 @@ export const localApi: FiszkiApi = {
       });
     }
 
+    // If all inspected cards belong to one lesson, default unanchored additions to it.
+    const uniqueLessonIds = new Set(origCards.map((c) => c.lesson_id));
+    const singleLessonId = uniqueLessonIds.size === 1 ? origCards[0].lesson_id : null;
+    const singleLessonName = singleLessonId !== null ? (lessonMap.get(singleLessonId) ?? null) : null;
+
+    const existingFronts = new Map<string, string>();
+    for (const c of allDbCards) {
+      if (seenDeleteIds.has(c.id!) || editedFrontChangeIds.has(c.id!)) continue;
+      const norm = normalizeFront(c.front);
+      if (!existingFronts.has(norm)) {
+        existingFronts.set(norm, lessonMap.get(c.lesson_id) ?? '');
+      }
+    }
+
+    const seenAddKeys = new Set<string>();
+    const additions: AiCardAddition[] = [];
+    for (const add of rawResult.additions) {
+      const key = `${normalizeFront(add.front)}\0${normalizeFront(add.back)}`;
+      if (seenAddKeys.has(key)) continue;
+      seenAddKeys.add(key);
+
+      const source = add.source_id !== null ? origMap.get(add.source_id) : undefined;
+      const lesson_id = source ? source.lesson_id : singleLessonId;
+      const lesson_name = source ? (lessonMap.get(source.lesson_id) ?? '') : singleLessonName;
+      additions.push({
+        front: add.front,
+        back: add.back,
+        example: add.example ?? null,
+        lesson_id,
+        lesson_name,
+        source_card_id: source?.id ?? null,
+        source_front: source?.front ?? null,
+        existing_in: existingFronts.get(normalizeFront(add.front)) ?? null,
+      });
+    }
+
     return {
       edits,
+      additions,
+      deletes,
       model,
       prompt: truncatedPrompt,
       inspected: origCards.length,

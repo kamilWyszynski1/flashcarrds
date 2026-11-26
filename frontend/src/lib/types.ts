@@ -213,8 +213,30 @@ export interface AiCardEdit {
   lesson_name: string;
 }
 
+export interface AiCardAddition {
+  front: string;
+  back: string;
+  example: string | null;
+  lesson_id: number | null;
+  lesson_name: string | null;
+  source_card_id?: number | null;
+  source_front?: string | null;
+  existing_in?: string | null;
+}
+
+export interface AiCardDelete {
+  card_id: number;
+  front: string;
+  back: string;
+  example: string | null;
+  lesson_id: number;
+  lesson_name: string;
+}
+
 export interface AiEditResponse {
   edits: AiCardEdit[];
+  additions: AiCardAddition[];
+  deletes: AiCardDelete[];
   model: string;
   prompt: string;
   inspected: number;

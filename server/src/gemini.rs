@@ -387,6 +387,21 @@ pub struct RawCardEdit {
     pub example: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawCardAddition {
+    pub front: String,
+    pub back: String,
+    pub example: Option<String>,
+    pub source_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RawBatchEditResult {
+    pub edits: Vec<RawCardEdit>,
+    pub additions: Vec<RawCardAddition>,
+    pub deletes: Vec<i64>,
+}
+
 pub fn build_batch_edit_prompt(
     front_lang: &str,
     back_lang: &str,
@@ -396,13 +411,17 @@ pub fn build_batch_edit_prompt(
     let prompt = prompt.trim();
     let cards_json = serde_json::to_string(cards).unwrap_or_else(|_| "[]".to_string());
     format!(
-        "You are editing an existing list of language flashcards.\n\
+        "You are helping a learner batch-edit a set of vocabulary flashcards.\n\
          The cards have front in {front_lang}, back in {back_lang}, and an optional example in {front_lang}.\n\n\
          Instruction from the learner:\n\
          {prompt}\n\n\
+         You can perform any combination of three operations:\n\
+         1. \"edits\": modify existing cards in place. Every item MUST preserve its exact \"id\" from the input JSON array (never invent new IDs here). Return ONLY cards that actually need changes; omit unchanged cards.\n\
+         2. \"additions\": create new cards (for example when splitting a card into multiple cards, adding a related form like non-reflexive \"levantar\" alongside \"levantarse\", or adding extra cards requested by the learner). When an addition is split or derived from an existing card, set \"source_id\" to that card's \"id\" so it is placed in the same lesson.\n\
+         3. \"deletes\": array of existing card \"id\" integers to remove (only when the learner asks to delete, remove, deduplicate, or replace cards). Never list the same \"id\" in both \"edits\" and \"deletes\".\n\n\
          Rules:\n\
-         - Return ONLY cards that actually need changes to satisfy the instruction; omit cards that do not need any modification.\n\
-         - Every returned item MUST preserve its exact \"id\" from the input JSON array. Never invent new IDs.\n\
+         - Return empty arrays for any operation not needed by the instruction (never add or delete cards unless requested).\n\
+         - When splitting a card (e.g. keeping an existing card and adding a second card, or splitting one entry into two): keep the original card untouched (omit it from \"edits\") or update it in \"edits\" to preserve its study progress, and put the newly created card(s) in \"additions\" with \"source_id\" set to the original card's \"id\".\n\
          - When adding context/disambiguation (e.g. differentiating ser vs estar), keep it concise (e.g. short note in parentheses on back or front as appropriate) while preserving accurate translations.\n\
          - Keep existing example if still valid (unless asked to change/remove it), or add/update example if helpful/requested.\n\
          - Return only JSON matching the schema.\n\n\
@@ -427,13 +446,30 @@ pub fn edit_response_schema() -> Value {
                     },
                     "required": ["id", "front", "back"]
                 }
+            },
+            "additions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "front": { "type": "string" },
+                        "back": { "type": "string" },
+                        "example": { "type": "string" },
+                        "source_id": { "type": "integer" }
+                    },
+                    "required": ["front", "back"]
+                }
+            },
+            "deletes": {
+                "type": "array",
+                "items": { "type": "integer" }
             }
         },
-        "required": ["edits"]
+        "required": ["edits", "additions", "deletes"]
     })
 }
 
-pub fn parse_edit_response(v: &Value) -> Result<Vec<RawCardEdit>, String> {
+pub fn parse_edit_response(v: &Value) -> Result<RawBatchEditResult, String> {
     if let Some(reason) = v
         .pointer("/promptFeedback/blockReason")
         .and_then(Value::as_str)
@@ -463,16 +499,38 @@ pub fn parse_edit_response(v: &Value) -> Result<Vec<RawCardEdit>, String> {
     }
     let parsed: Value = serde_json::from_str(strip_code_fence(&text))
         .map_err(|e| format!("answer was not valid JSON: {e}"))?;
-    let edits = match parsed {
-        Value::Array(a) => a,
-        Value::Object(mut o) => match o.remove("edits") {
-            Some(Value::Array(a)) => a,
-            _ => return Err("answer has no \"edits\" array".into()),
-        },
+
+    let (raw_edits, raw_additions, raw_deletes) = match parsed {
+        Value::Array(a) => (a, Vec::new(), Vec::new()),
+        Value::Object(mut o) => {
+            let edits = match o.remove("edits") {
+                Some(Value::Array(a)) => Some(a),
+                _ => None,
+            };
+            let additions = match o.remove("additions") {
+                Some(Value::Array(a)) => Some(a),
+                _ => None,
+            };
+            let deletes = match o.remove("deletes") {
+                Some(Value::Array(a)) => Some(a),
+                _ => None,
+            };
+            if edits.is_none() && additions.is_none() && deletes.is_none() {
+                return Err(
+                    "answer has no \"edits\", \"additions\", or \"deletes\" array".into(),
+                );
+            }
+            (
+                edits.unwrap_or_default(),
+                additions.unwrap_or_default(),
+                deletes.unwrap_or_default(),
+            )
+        }
         _ => return Err("answer has unexpected shape".into()),
     };
-    let mut out = Vec::new();
-    for e in edits {
+
+    let mut edits = Vec::new();
+    for e in raw_edits {
         let id = match e.get("id").and_then(Value::as_i64) {
             Some(id) => id,
             None => continue,
@@ -498,14 +556,60 @@ pub fn parse_edit_response(v: &Value) -> Result<Vec<RawCardEdit>, String> {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(String::from);
-        out.push(RawCardEdit {
+        edits.push(RawCardEdit {
             id,
             front,
             back,
             example,
         });
     }
-    Ok(out)
+
+    let mut additions = Vec::new();
+    for a in raw_additions {
+        let front = a
+            .get("front")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let back = a
+            .get("back")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if front.is_empty() || back.is_empty() {
+            continue;
+        }
+        let example = a
+            .get("example")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        let source_id = a.get("source_id").and_then(Value::as_i64);
+        additions.push(RawCardAddition {
+            front,
+            back,
+            example,
+            source_id,
+        });
+    }
+
+    let mut deletes = Vec::new();
+    for d in raw_deletes {
+        if let Some(id) = d.as_i64() {
+            deletes.push(id);
+        } else if let Some(id) = d.get("id").and_then(Value::as_i64) {
+            deletes.push(id);
+        }
+    }
+
+    Ok(RawBatchEditResult {
+        edits,
+        additions,
+        deletes,
+    })
 }
 
 fn strip_code_fence(s: &str) -> &str {
@@ -725,7 +829,7 @@ impl GeminiClient {
         back_lang: &str,
         prompt: &str,
         cards: &[EditCardInput],
-    ) -> Result<Vec<RawCardEdit>, GeminiError> {
+    ) -> Result<RawBatchEditResult, GeminiError> {
         if api_key.trim().is_empty() {
             return Err(GeminiError::NoApiKey);
         }
@@ -762,9 +866,18 @@ impl GeminiClient {
                 .attempt_edit(&url, api_key, &body, attempt_timeout)
                 .await;
             match res {
-                Ok((edits, elapsed, finish)) => {
-                    tracing::info!(model, attempt, edits = edits.len(), latency_ms = elapsed.as_millis() as u64, finish_reason = %finish, "gemini: edit_cards ok");
-                    return Ok(edits);
+                Ok((result, elapsed, finish)) => {
+                    tracing::info!(
+                        model,
+                        attempt,
+                        edits = result.edits.len(),
+                        additions = result.additions.len(),
+                        deletes = result.deletes.len(),
+                        latency_ms = elapsed.as_millis() as u64,
+                        finish_reason = %finish,
+                        "gemini: edit_cards ok"
+                    );
+                    return Ok(result);
                 }
                 Err(e) => {
                     let remaining = self.timeout.saturating_sub(started.elapsed() + backoff);
@@ -867,21 +980,21 @@ impl GeminiClient {
         Ok((cards, elapsed, finish))
     }
 
-    /// One HTTP round-trip for batch edits bounded by `timeout`; `Ok` carries (edits, latency, finishReason).
+    /// One HTTP round-trip for batch edits bounded by `timeout`; `Ok` carries (result, latency, finishReason).
     async fn attempt_edit(
         &self,
         url: &str,
         api_key: &str,
         body: &Value,
         timeout: Duration,
-    ) -> Result<(Vec<RawCardEdit>, Duration, String), GeminiError> {
+    ) -> Result<(RawBatchEditResult, Duration, String), GeminiError> {
         let (v, text, elapsed, finish) = self.post_json(url, api_key, body, timeout).await?;
-        let edits = parse_edit_response(&v).map_err(|reason| GeminiError::BadResponse {
+        let result = parse_edit_response(&v).map_err(|reason| GeminiError::BadResponse {
             reason,
             body: truncate_body(&text, BODY_LOG_LIMIT),
             elapsed,
         })?;
-        Ok((edits, elapsed, finish))
+        Ok((result, elapsed, finish))
     }
 }
 
@@ -1162,9 +1275,9 @@ mod tests {
         let cards = vec![
             EditCardInput {
                 id: 42,
-                front: "el perro".into(),
-                back: "pies".into(),
-                example: Some("El perro ladra.".into()),
+                front: "levantarse".into(),
+                back: "wstawać".into(),
+                example: Some("Me levanto a las siete.".into()),
             },
             EditCardInput {
                 id: 43,
@@ -1173,32 +1286,35 @@ mod tests {
                 example: None,
             },
         ];
-        let p = build_batch_edit_prompt("Español", "Polski", "Add plural forms", &cards);
+        let p = build_batch_edit_prompt("Español", "Polski", "Split -se verbs", &cards);
         assert!(p.contains("in Español"));
         assert!(p.contains("in Polski"));
-        assert!(p.contains("Add plural forms"));
+        assert!(p.contains("Split -se verbs"));
         assert!(p.contains("\"id\":42"));
         assert!(p.contains("\"id\":43"));
         assert!(p.contains("preserve its exact \"id\""));
+        assert!(p.contains("\"additions\""));
+        assert!(p.contains("\"deletes\""));
+        assert!(p.contains("\"source_id\""));
     }
 
     #[test]
     fn parses_edit_response_formats_and_strips_fences() {
-        // Wrapped in {"edits": [...]}
+        // Wrapped in {"edits": [...], "additions": [...], "deletes": [...]}
         let v1 = json!({
             "candidates": [{
                 "content": {
                     "parts": [{
-                        "text": "```json\n{\"edits\": [{\"id\": 1, \"front\": \" ser \", \"back\": \" być (cecha stała) \", \"example\": \" Soy profesor. \"}, {\"id\": 2, \"front\": \"\", \"back\": \"\"}]}\n```"
+                        "text": "```json\n{\"edits\": [{\"id\": 1, \"front\": \" ser \", \"back\": \" być (cecha stała) \", \"example\": \" Soy profesor. \"}, {\"id\": 2, \"front\": \"\", \"back\": \"\"}], \"additions\": [{\"front\": \" levantar \", \"back\": \" podnosić \", \"example\": \" Levanto la mano. \", \"source_id\": 10}, {\"front\": \"\", \"back\": \"skip\"}], \"deletes\": [7, {\"id\": 8}, \"ignored\"]}\n```"
                     }]
                 },
                 "finishReason": "STOP"
             }]
         });
-        let edits1 = parse_edit_response(&v1).unwrap();
-        assert_eq!(edits1.len(), 1);
+        let res1 = parse_edit_response(&v1).unwrap();
+        assert_eq!(res1.edits.len(), 1);
         assert_eq!(
-            edits1[0],
+            res1.edits[0],
             RawCardEdit {
                 id: 1,
                 front: "ser".into(),
@@ -1206,6 +1322,16 @@ mod tests {
                 example: Some("Soy profesor.".into()),
             }
         );
+        assert_eq!(
+            res1.additions,
+            vec![RawCardAddition {
+                front: "levantar".into(),
+                back: "podnosić".into(),
+                example: Some("Levanto la mano.".into()),
+                source_id: Some(10),
+            }]
+        );
+        assert_eq!(res1.deletes, vec![7, 8]);
 
         // Bare array format [...]
         let v2 = json!({
@@ -1217,10 +1343,10 @@ mod tests {
                 }
             }]
         });
-        let edits2 = parse_edit_response(&v2).unwrap();
-        assert_eq!(edits2.len(), 1);
+        let res2 = parse_edit_response(&v2).unwrap();
+        assert_eq!(res2.edits.len(), 1);
         assert_eq!(
-            edits2[0],
+            res2.edits[0],
             RawCardEdit {
                 id: 5,
                 front: "estar".into(),
@@ -1228,6 +1354,24 @@ mod tests {
                 example: None,
             }
         );
+        assert!(res2.additions.is_empty());
+        assert!(res2.deletes.is_empty());
+
+        // Additions-only object
+        let v3 = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "text": "{\"additions\": [{\"front\": \"correr\", \"back\": \"biegać\"}]}"
+                    }]
+                }
+            }]
+        });
+        let res3 = parse_edit_response(&v3).unwrap();
+        assert!(res3.edits.is_empty());
+        assert_eq!(res3.additions.len(), 1);
+        assert_eq!(res3.additions[0].source_id, None);
+        assert!(res3.deletes.is_empty());
 
         // Blocked & error cases
         let blocked = json!({"promptFeedback": {"blockReason": "SAFETY"}});
@@ -1244,6 +1388,6 @@ mod tests {
             json!({"candidates": [{"content": {"parts": [{"text": "{\"other\": []}"}]}}]});
         assert!(parse_edit_response(&bad_shape)
             .unwrap_err()
-            .contains("answer has no \"edits\" array"));
+            .contains("answer has no \"edits\", \"additions\", or \"deletes\" array"));
     }
 }

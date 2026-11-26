@@ -3,15 +3,22 @@ import { api } from './api';
 import { DEFAULT_THEME, applyTheme, isTheme, watchSystemTheme } from './theme';
 import type { ExtractedCard, Overview, Settings } from './types';
 
+export type DraftAction = 'edit' | 'add' | 'delete';
+
 export interface DraftRow extends ExtractedCard {
   include: boolean;
   key: number;
-  /** Present when source === 'edit': existing card being updated in place. */
+  /** Present when source === 'edit': operation to apply to this row. Defaults to 'edit'. */
+  action?: DraftAction;
+  /** Present when source === 'edit' and action is 'edit' or 'delete'. */
   card_id?: number;
   orig_front?: string;
   orig_back?: string;
   orig_example?: string | null;
-  lesson_name?: string;
+  lesson_id?: number | null;
+  lesson_name?: string | null;
+  /** Original card front when an addition was split/derived from an existing card. */
+  source_front?: string | null;
 }
 
 /** Cards waiting on the Review screen (from a photo, pasted list, prompt, or batch edit). */

@@ -502,26 +502,32 @@ describe('gemini', () => {
   });
 
   describe('batchEdit & buildBatchEditPrompt', () => {
-    it('buildBatchEditPrompt includes cards json and instruction', () => {
-      const p = buildBatchEditPrompt('Español', 'Polski', 'differentiate ser vs estar', [
-        { id: 1, front: 'es', back: 'jest' },
+    it('buildBatchEditPrompt includes cards json, operations, and instruction', () => {
+      const p = buildBatchEditPrompt('Español', 'Polski', 'split reflexive verbs ending in -se', [
+        { id: 1, front: 'levantarse', back: 'wstawać', example: 'Me levanto a las siete.' },
         { id: 2, front: 'está', back: 'jest', example: 'Está en casa.' },
       ]);
-      expect(p).toContain('differentiate ser vs estar');
+      expect(p).toContain('split reflexive verbs ending in -se');
       expect(p).toContain('"id":1');
-      expect(p).toContain('"front":"es"');
+      expect(p).toContain('"front":"levantarse"');
       expect(p).toContain('"id":2');
       expect(p).toContain('"example":"Está en casa."');
-      expect(p).toContain('Return ONLY cards that actually need changes');
+      expect(p).toContain('"edits"');
+      expect(p).toContain('"additions"');
+      expect(p).toContain('"deletes"');
+      expect(p).toContain('"source_id"');
     });
 
-    it('editResponseSchema has object with edits array', () => {
+    it('editResponseSchema has object with edits, additions, and deletes arrays', () => {
       const schema: any = editResponseSchema();
       expect(schema.type).toBe('object');
       expect(schema.properties.edits.type).toBe('array');
+      expect(schema.properties.additions.type).toBe('array');
+      expect(schema.properties.deletes.type).toBe('array');
+      expect(schema.required).toEqual(['edits', 'additions', 'deletes']);
     });
 
-    it('parseEditResponse parses valid edits and cleans fields', () => {
+    it('parseEditResponse parses edits, additions, and deletes and cleans fields', () => {
       const v = {
         candidates: [
           {
@@ -535,6 +541,12 @@ describe('gemini', () => {
                       { id: 'not an int', front: 'bad', back: 'bad' },
                       { id: 3, front: '', back: 'empty front' },
                     ],
+                    additions: [
+                      { front: ' levantar ', back: ' podnosić ', example: ' Voy a levantar la caja. ', source_id: 4 },
+                      { front: 'correr', back: 'biegać' },
+                      { front: '', back: 'missing front' },
+                    ],
+                    deletes: [7, { id: 8 }, 'ignored'],
                   }),
                 },
               ],
@@ -542,16 +554,22 @@ describe('gemini', () => {
           },
         ],
       };
-      const edits = parseEditResponse(v);
-      expect(edits.length).toBe(2);
-      expect(edits[0]).toEqual({ id: 1, front: 'es', back: 'jest (cecha stała)', example: 'Es profesor.' });
-      expect(edits[1]).toEqual({ id: 2, front: 'está', back: 'jest (stan tymczasowy)', example: null });
+      const res = parseEditResponse(v);
+      expect(res.edits).toEqual([
+        { id: 1, front: 'es', back: 'jest (cecha stała)', example: 'Es profesor.' },
+        { id: 2, front: 'está', back: 'jest (stan tymczasowy)', example: null },
+      ]);
+      expect(res.additions).toEqual([
+        { front: 'levantar', back: 'podnosić', example: 'Voy a levantar la caja.', source_id: 4 },
+        { front: 'correr', back: 'biegać', example: null, source_id: null },
+      ]);
+      expect(res.deletes).toEqual([7, 8]);
     });
 
-    it('parseEditResponse handles errors and fences', () => {
+    it('parseEditResponse handles errors, legacy bare arrays, and partial objects', () => {
       expect(() => parseEditResponse({ promptFeedback: { blockReason: 'OTHER' } })).toThrow('blocked by Gemini');
       expect(() => parseEditResponse({})).toThrow('no candidates');
-      const candidateResp = {
+      const bareArray = {
         candidates: [
           {
             content: {
@@ -560,10 +578,34 @@ describe('gemini', () => {
           },
         ],
       };
-      expect(() => parseEditResponse(candidateResp)).not.toThrow();
+      expect(parseEditResponse(bareArray)).toEqual({
+        edits: [{ id: 5, front: 'a', back: 'b', example: null }],
+        additions: [],
+        deletes: [],
+      });
+
+      const additionsOnly = {
+        candidates: [
+          {
+            content: {
+              parts: [{ text: JSON.stringify({ additions: [{ front: 'levantar', back: 'podnosić', source_id: 1 }] }) }],
+            },
+          },
+        ],
+      };
+      expect(parseEditResponse(additionsOnly)).toEqual({
+        edits: [],
+        additions: [{ front: 'levantar', back: 'podnosić', example: null, source_id: 1 }],
+        deletes: [],
+      });
+
+      const badShape = {
+        candidates: [{ content: { parts: [{ text: '{"other": []}' }] } }],
+      };
+      expect(() => parseEditResponse(badShape)).toThrow('answer has no "edits", "additions", or "deletes" array');
     });
 
-    it('editCardsWithGemini validates cards and returns raw edits', async () => {
+    it('editCardsWithGemini validates cards and returns edits, additions, and deletes', async () => {
       await expect(
         editCardsWithGemini({
           apiKey: 'key',
@@ -585,6 +627,8 @@ describe('gemini', () => {
                     {
                       text: JSON.stringify({
                         edits: [{ id: 10, front: 'ser', back: 'być (cecha)', example: 'Ser bueno.' }],
+                        additions: [{ front: 'levantar', back: 'podnosić', example: 'Levantar la mano.', source_id: 11 }],
+                        deletes: [12],
                       }),
                     },
                   ],
@@ -595,19 +639,27 @@ describe('gemini', () => {
           { status: 200 }
         );
 
-      const edits = await editCardsWithGemini({
+      const res = await editCardsWithGemini({
         apiKey: 'test-key',
         model: 'gemini-flash-latest',
-        prompt: 'add disambiguation',
-        cards: [{ id: 10, front: 'ser', back: 'być' }],
+        prompt: 'add disambiguation and split',
+        cards: [
+          { id: 10, front: 'ser', back: 'być' },
+          { id: 11, front: 'levantarse', back: 'wstawać' },
+          { id: 12, front: 'dup', back: 'dup' },
+        ],
         frontLang: 'Español',
         backLang: 'Polski',
         fetchImpl: fakeFetch,
       });
 
-      expect(edits.length).toBe(1);
-      expect(edits[0].id).toBe(10);
-      expect(edits[0].back).toBe('być (cecha)');
+      expect(res.edits.length).toBe(1);
+      expect(res.edits[0].id).toBe(10);
+      expect(res.edits[0].back).toBe('być (cecha)');
+      expect(res.additions).toEqual([
+        { front: 'levantar', back: 'podnosić', example: 'Levantar la mano.', source_id: 11 },
+      ]);
+      expect(res.deletes).toEqual([12]);
     });
   });
 });

@@ -45,6 +45,7 @@ export interface FiszkiApi {
   updateCard: (id: number, patch: { front?: string; back?: string; example?: string; lesson_id?: number; reset_progress?: boolean }) => Promise<Card>;
   updateCardsBulk: (updates: BulkCardUpdate[]) => Promise<{ updated: number }>;
   deleteCard: (id: number) => Promise<void>;
+  deleteCardsBulk: (ids: number[]) => Promise<{ deleted: number }>;
 
   studyQueue: (p?: { scope?: string; mode?: string; ids?: string; limit?: number; direction?: string }) => Promise<StudyItem[]>;
   review: (card_id: number, grade: Grade, direction: string) => Promise<ReviewResult>;

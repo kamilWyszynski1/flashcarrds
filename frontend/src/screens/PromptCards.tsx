@@ -3,6 +3,7 @@ import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { Icon } from '../components/Icon';
 import { Button, Chip, ErrorBox, Footer, GroupSelector, Label, Spinner, TopBar, fieldClass } from '../components/ui';
 import { api, isLocalBackend } from '../lib/api';
+import { buildEditDraftRows } from '../lib/batchEdit';
 import { describeExtractError } from '../lib/extractError';
 import { FREE_TIER_MODELS, MAX_EDIT_CARDS, runWithModelFallback, type FallbackProgress } from '../lib/gemini';
 import { markCaptureFlowStart, useSheets } from '../lib/sheets';
@@ -414,6 +415,8 @@ export function PromptCreate() {
 const EDIT_CHIPS = [
   { label: 'Disambiguate (e.g. ser vs estar)', text: 'Add brief context in parentheses to differentiate easily confused words (e.g. ser vs estar).' },
   { label: 'Add example sentences', text: 'Add a short example sentence where missing.' },
+  { label: 'Split -se verbs', text: 'For reflexive verbs ending in -se, keep the reflexive card and add a separate card for the base verb without -se with its translation and example.' },
+  { label: 'Remove duplicates', text: 'Delete duplicate cards with the same meaning, keeping the clearest one.' },
   { label: 'Nouns with article', text: 'Ensure nouns include their definite article (el/la).' },
   { label: 'Subject pronouns', text: 'Add subject pronouns to conjugated verbs where ambiguous.' },
 ];
@@ -604,8 +607,9 @@ export function BatchEdit() {
       if (res.model && res.model !== settings.gemini_model) {
         void api.settings().then(setSettings);
       }
-      if (res.edits.length === 0) {
-        setError('No cards needed changes for that prompt – try making your instruction more specific.');
+      const draftRows = buildEditDraftRows(res);
+      if (draftRows.length === 0) {
+        setError('No changes were suggested for that prompt – try making your instruction more specific.');
         return;
       }
       setDraft({
@@ -615,19 +619,7 @@ export function BatchEdit() {
         editLessonId: lessonId ?? undefined,
         editCardIds: scopedCards.map((c) => c.id),
         editScopeLabel: scopeSubtitle,
-        cards: res.edits.map((e, i) => ({
-          front: e.front,
-          back: e.back,
-          example: e.example,
-          confidence: 1,
-          include: true,
-          key: i + 1,
-          card_id: e.card_id,
-          orig_front: e.orig_front,
-          orig_back: e.orig_back,
-          orig_example: e.orig_example,
-          lesson_name: e.lesson_name,
-        })),
+        cards: draftRows,
       });
       navigate('/review', { replace: retry });
     } catch (e) {
@@ -678,8 +670,9 @@ export function BatchEdit() {
         setSelectedModel(res.model);
         void api.settings().then(setSettings);
       }
-      if (res.edits.length === 0) {
-        setError('No cards needed changes for that prompt – try making your instruction more specific.');
+      const draftRows = buildEditDraftRows(res);
+      if (draftRows.length === 0) {
+        setError('No changes were suggested for that prompt – try making your instruction more specific.');
         return;
       }
       setDraft({
@@ -689,19 +682,7 @@ export function BatchEdit() {
         editLessonId: lessonId ?? undefined,
         editCardIds: scopedCards.map((c) => c.id),
         editScopeLabel: scopeSubtitle,
-        cards: res.edits.map((e, i) => ({
-          front: e.front,
-          back: e.back,
-          example: e.example,
-          confidence: 1,
-          include: true,
-          key: i + 1,
-          card_id: e.card_id,
-          orig_front: e.orig_front,
-          orig_back: e.orig_back,
-          orig_example: e.orig_example,
-          lesson_name: e.lesson_name,
-        })),
+        cards: draftRows,
       });
       navigate('/review', { replace: retry });
     } catch (e) {
@@ -810,7 +791,7 @@ export function BatchEdit() {
         )}
 
         <div className="bg-surface-container-low rounded-xl p-3.5 text-body-sm text-on-surface-variant mb-4">
-          <span className="font-semibold text-on-surface">{scopeSubtitle}</span>. Only cards relevant to your prompt will be modified, and you can review every change before saving.
+          <span className="font-semibold text-on-surface">{scopeSubtitle}</span>. You can edit, split, add, or remove cards — every change is shown for review before saving.
         </div>
 
         <Label>How to edit these cards</Label>
@@ -819,7 +800,7 @@ export function BatchEdit() {
           rows={4}
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
-          placeholder="e.g. differentiate between verb ser and estar by adding context in parentheses"
+          placeholder="e.g. split reflexive verbs (-se) to also add the base verb, differentiate ser vs estar, or remove duplicates"
         />
 
         <div className="flex flex-wrap gap-2 mt-2">
@@ -899,7 +880,7 @@ export function BatchEdit() {
           disabled={!prompt.trim() || scopedCards.length === 0}
           onClick={() => void runEdit()}
         >
-          Preview edits
+          Preview changes
         </Button>
         <Button
           variant="tonal"

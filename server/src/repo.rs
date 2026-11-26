@@ -548,6 +548,28 @@ pub fn delete_card(conn: &Connection, id: i64) -> Result<bool> {
     Ok(conn.execute("DELETE FROM cards WHERE id=?1", [id])? > 0)
 }
 
+pub fn delete_cards_bulk(conn: &Connection, ids: &[i64]) -> Result<usize> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    if ids.len() > 500 {
+        return Err(anyhow!("too many deletes in one request (max 500)"));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let tx = conn.unchecked_transaction()?;
+    let mut deleted = 0usize;
+    {
+        let mut st = tx.prepare("DELETE FROM cards WHERE id=?1")?;
+        for &id in ids {
+            if seen.insert(id) {
+                deleted += st.execute([id])?;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(deleted)
+}
+
 pub fn update_cards_bulk(conn: &Connection, updates: &[BulkCardUpdate]) -> Result<usize> {
     if updates.is_empty() {
         return Ok(0);

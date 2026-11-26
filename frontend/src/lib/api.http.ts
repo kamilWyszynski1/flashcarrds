@@ -79,6 +79,7 @@ export const httpApi: FiszkiApi = {
     request<Card>('PATCH', `/cards/${id}`, patch),
   updateCardsBulk: (updates: BulkCardUpdate[]) => request<{ updated: number }>('POST', '/cards/bulk-patch', { updates }),
   deleteCard: (id: number) => request<void>('DELETE', `/cards/${id}`),
+  deleteCardsBulk: (ids: number[]) => request<{ deleted: number }>('POST', '/cards/bulk-delete', { ids }),
 
   studyQueue: (p: { scope?: string; mode?: string; ids?: string; limit?: number; direction?: string } = {}) =>
     request<StudyItem[]>('GET', `/study/queue${q(p)}`),

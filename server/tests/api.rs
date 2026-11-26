@@ -1368,6 +1368,70 @@ async fn ai_edit_cards_and_bulk_patch_endpoint_flow() {
     assert_eq!(card["example"], "Soy profesor.");
     assert_eq!(card["status"], "learned");
     assert_eq!(card["reps"], 1);
+
+    // Test AI Edit returning additions (split) + deletes
+    *fake.reply.lock().unwrap() = Some((
+        200,
+        json!({"candidates":[{"content":{"parts":[{"text": json!({
+            "edits": [
+                {"id": ids[1], "front": "estar edited", "back": "być"}
+            ],
+            "additions": [
+                {"front": "levantar", "back": "podnosić", "example": "Voy a levantar la caja.", "source_id": ids[0]},
+                {"front": "levantar", "back": "podnosić", "source_id": ids[0]}
+            ],
+            "deletes": [ids[1], ids[1], 99999]
+        }).to_string()}]},"finishReason":"STOP"}]}),
+    ));
+
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/api/cards/ai-edit",
+        Some(json!({"prompt": "split and clean up", "card_ids": ids})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    // ids[1] was in both edits and deletes -> delete wins
+    assert_eq!(v["edits"].as_array().unwrap().len(), 0);
+    let additions = v["additions"].as_array().unwrap();
+    assert_eq!(additions.len(), 1);
+    assert_eq!(additions[0]["front"], "levantar");
+    assert_eq!(additions[0]["back"], "podnosić");
+    assert_eq!(additions[0]["example"], "Voy a levantar la caja.");
+    assert_eq!(additions[0]["lesson_id"], lesson_id);
+    assert_eq!(additions[0]["source_card_id"], ids[0]);
+    assert_eq!(additions[0]["source_front"], "ser");
+    assert!(additions[0]["existing_in"].is_null());
+
+    let deletes = v["deletes"].as_array().unwrap();
+    assert_eq!(deletes.len(), 1);
+    assert_eq!(deletes[0]["card_id"], ids[1]);
+    assert_eq!(deletes[0]["front"], "estar");
+
+    // Bulk delete validation and execution
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/api/cards/bulk-delete",
+        Some(json!({"ids": []})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert_eq!(v["message"], "no cards to delete");
+
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/api/cards/bulk-delete",
+        Some(json!({"ids": [ids[1], ids[1], 99999]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["deleted"], 1);
+
+    let (st, _) = call(&app, "GET", &format!("/api/cards/{}", ids[1]), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
